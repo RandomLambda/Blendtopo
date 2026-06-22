@@ -8,16 +8,20 @@ forces act (loads); it figures out where material needs to be.
 Free, open source (GPL-3.0), and zero external dependencies: it runs on
 Blender's bundled numpy and built-in modifiers. Nothing to pip-install.
 
-![The Blendtopo panel and a result forming inside the build space](docs/panel.png)
+
+<img width="970" height="691" alt="panel" src="https://github.com/user-attachments/assets/c08d2d76-73c3-471f-8200-bd21a51695a3" />
+The Blendtopo panel and a result forming inside the build space
 
 ## Gallery
 
 | | |
 |---|---|
-| ![Setting up the build space, load and bearing](videos/output_gifs/Video_2026-06-21_162332.gif) | ![Live optimization](videos/output_gifs/Video_2026-06-21_190131.gif) |
+| <img width="400" height="213" alt="Video_2026-06-21_190131" src="https://github.com/user-attachments/assets/395e7637-6855-4fa3-bc81-935ce89ae645" /> | <img width="400" height="250" alt="Video_2026-06-21_162332" src="https://github.com/user-attachments/assets/1c1ea9d6-898d-40df-8246-5289d54cc054" /> |
 | *Set up: build space, load and bearing* | *Live coarse-to-fine optimization* |
-| ![Refining to the final result](videos/output_gifs/Video_2026-06-21_195839.gif) | ![Optimized organic result](videos/output_gifs/Video_2026-06-21_200149.gif) |
-| *Refining the structure* | *Optimized organic result* |
+<!--
+| <img width="800" height="426" alt="Video_2026-06-21_200149" src="https://github.com/user-attachments/assets/3be827b9-9b71-4744-a7f0-f8c9aa2bbeda" /> |
+| *Refining the structure* | *Optimized organic result* | 
+-->
 
 ## Install (Blender 4.2+)
 
@@ -63,11 +67,6 @@ by a self-test at startup; it silently falls back to CPU otherwise).
 
 
 ## Changelog
-<img width="970" height="691" alt="panel" src="https://github.com/user-attachments/assets/c08d2d76-73c3-471f-8200-bd21a51695a3" />
-
-<img width="800" height="426" alt="Video_2026-06-21_190131" src="https://github.com/user-attachments/assets/395e7637-6855-4fa3-bc81-935ce89ae645" />
-<img width="800" height="499" alt="Video_2026-06-21_162332" src="https://github.com/user-attachments/assets/1c1ea9d6-898d-40df-8246-5289d54cc054" />
-<img width="800" height="426" alt="Video_2026-06-21_200149" src="https://github.com/user-attachments/assets/3be827b9-9b71-4744-a7f0-f8c9aa2bbeda" />
 
 - **0.8.0** — Geometric-multigrid preconditioner (grid-independent solve speed);
   "Continue" to resume more iterations; final pass runs full (no early stop);
