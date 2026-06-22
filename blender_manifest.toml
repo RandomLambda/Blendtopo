@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "blendtopo"
+version = "0.8.1"
+name = "Blendtopo - Topology Optimization"
+tagline = "SIMP topology optimization for solid mesh parts"
+maintainer = "Philip Gruenenfelder"
+type = "add-on"
+website = "https://github.com/CHANGE-ME/blendtopo"
+
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+# Pure-numpy core; numpy ships with Blender, so no wheels are bundled.
