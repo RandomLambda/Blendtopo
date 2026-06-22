@@ -6,7 +6,7 @@ name = "Blendtopo - Topology Optimization"
 tagline = "SIMP topology optimization for solid mesh parts"
 maintainer = "Philip Gruenenfelder"
 type = "add-on"
-website = "https://github.com/CHANGE-ME/blendtopo"
+website = "https://github.com/RandomLambda/Blendtopo"
 
 blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
