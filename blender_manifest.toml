@@ -1,14 +1,45 @@
 schema_version = "1.0.0"
 
 id = "blendtopo"
-version = "0.8.1"
+version = "1.1.1"
 name = "Blendtopo - Topology Optimization"
 tagline = "SIMP topology optimization for solid mesh parts"
 maintainer = "Philip Gruenenfelder"
 type = "add-on"
 website = "https://github.com/RandomLambda/Blendtopo"
 
+tags = ["Mesh", "Physics"]
+
 blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Philip Gruenenfelder"]
 
-# Pure-numpy core; numpy ships with Blender, so no wheels are bundled.
+# Declared explicitly because bundled binary wheels (rtree) are platform-
+# specific; a matching wheel now exists for every one of these five.
+platforms = ["windows-x64", "windows-arm64", "macos-x64", "macos-arm64", "linux-x64"]
+
+# Numpy-first core; numpy ships with Blender. For the heavy-mesh inside/outside
+# test (voxelization) we bundle trimesh + rtree as wheels (below) so the fast
+# path is always available -- never gated behind whatever the user happens to
+# have pip-installed. Pure numpy remains the built-in fallback (used for small
+# meshes and on any platform without a matching wheel). No CuPy/GPU code here;
+# see the GPU edition on GitHub for that.
+#
+# threadpoolctl (pure-python, one wheel for every platform) lets the solver
+# size numpy's BLAS thread pool at runtime -- see core/compute_plan.py.
+wheels = [
+    "./wheels/trimesh-4.12.2-py3-none-any.whl",
+    "./wheels/rtree-1.4.1-py3-none-win_amd64.whl",
+    "./wheels/rtree-1.4.1-py3-none-win_arm64.whl",
+    "./wheels/rtree-1.4.1-py3-none-macosx_11_0_arm64.whl",
+    "./wheels/rtree-1.4.1-py3-none-macosx_10_9_x86_64.whl",
+    "./wheels/rtree-1.4.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "./wheels/threadpoolctl-3.6.0-py3-none-any.whl",
+]
+
+# Filesystem access: the SIMP solve and the heavy-mesh inside test each run in a
+# short-lived helper subprocess (kept off Blender's main thread so the UI never
+# freezes); job/result/progress data is exchanged with it via temp files only
+# (tempfile.mkdtemp), never inside the add-on's own install directory.
+[permissions]
+files = "Exchanges data with helper subprocesses during optimization"
