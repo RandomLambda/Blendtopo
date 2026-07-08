@@ -1,13 +1,25 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Operators: list management, and the modal optimization run.
 
-The heavy FEA + SIMP work runs in a background thread so the viewport stays
-responsive; the modal timer (main thread) drains density snapshots from a queue
-and builds the preview meshes (bpy must be touched only on the main thread).
+Preferred path: voxelization, the FEA/SIMP solve and per-iteration meshing for
+a whole level run in a plain-Python subprocess (see core.solver_worker); the
+modal timer just polls it and turns finished verts/faces into a Blender
+object, so Blender's main thread does the bare minimum and the viewport stays
+interactive even on fine grids.
+
+Fallback (no subprocess available): both heavy phases run as cooperative
+generators advanced by the modal timer instead, so no single tick blocks the
+UI:
+
+* voxelizing a level (per-point ray-casts) is drained under a per-tick time
+  budget, showing a percentage instead of freezing while a finer grid is built;
+* the SIMP solve yields one iteration per tick, rebuilding the preview mesh.
+
+Either way, no background threads are used (threads are a known Blender crash
+source) - only subprocesses, which cannot touch or crash Blender state.
 """
 
-import queue
-import threading
+import time
 
 import numpy as np
 
@@ -15,7 +27,7 @@ import bpy
 from bpy.types import Operator
 from bpy.props import IntProperty, StringProperty, BoolProperty
 
-from .core import voxelize, extract
+from .core import voxelize, extract, solver_worker
 from .core.simp import Problem, resample_density, resample_displacement
 
 
@@ -144,29 +156,47 @@ class TO_OT_run(Operator):
         _RUN_COUNTER += 1
         self._run_id = _RUN_COUNTER
         self._settings = s
-        self._q = queue.Queue()
-        self._stop = threading.Event()
-        self._worker = None
+        self._gen = None          # active SIMP generator for the current level
+        self._prob = None         # active Problem (for last_u after a level)
+        self._voxgen = None       # active in-process voxelization generator
+        self._voxizer = None      # active out-of-process voxelizer (in-proc mode)
+        self._solver = None       # active unified solver subprocess (preferred)
+        self._stop_requested = False
+        self._phase = 'voxel'     # 'voxel' (building grid) or 'solve' (in-proc)
         self._level_idx = 0
         self._grid = None
         self._last_rho = None
+        self._last_vsize = None
         self._last_obj_name = ""
         self._interrupted = False
         self._all_done = False
         self._error = ""
+        self._cache_final = None  # raw fields for the Continue cache
         self._coll = _results_collection(context)
         self._depsgraph = context.evaluated_depsgraph_get()
+
+        # Preferred path: run each whole level (voxelize + FEA/SIMP + meshing)
+        # in a subprocess so Blender's main thread does the bare minimum. Falls
+        # back to the in-process generators if no subprocess can be launched.
+        self._mode = 'solver' if solver_worker.solver_available() else 'inproc'
 
         if self.resume:
             if not _RESUME_CACHE:
                 self.report({'ERROR'}, "Nothing to resume - run an optimization first")
                 return {'CANCELLED'}
-            self._prev_grid = _RESUME_CACHE['grid']
-            self._prev_rho3d = _RESUME_CACHE['rho3d']
-            self._prev_u = _RESUME_CACHE['u']
-            self._last_obj_name = _RESUME_CACHE.get('last_obj', '')
+            rc = _RESUME_CACHE
+            self._last_obj_name = rc.get('last_obj', '')
             self._levels = [s.resolution]          # one more full pass at final res
+            # Warm-start dict for the subprocess solver.
+            self._prev = {'prev_rho3d': rc['rho3d'], 'prev_origin': rc['origin'],
+                          'prev_vsize': rc['vsize'], 'prev_u': rc['u'],
+                          'prev_node_dims': rc['node_dims']}
+            # Equivalent fields for the in-process fallback.
+            self._prev_grid = voxelize.Grid(rc['dims'], rc['origin'], rc['vsize'])
+            self._prev_rho3d = rc['rho3d']
+            self._prev_u = rc['u']
         else:
+            self._prev = None
             self._prev_grid = None
             self._prev_rho3d = None
             self._prev_u = None
@@ -190,10 +220,110 @@ class TO_OT_run(Operator):
         return {'RUNNING_MODAL'}
 
     def _start_level(self, context):
-        """Main thread: voxelize this level (bpy), then spawn the solver thread."""
+        """Begin a level.
+
+        Preferred ('solver') mode: hand the *entire* level - voxelization, FEA/
+        SIMP and per-iteration meshing - to a subprocess. The main thread then
+        only polls and turns finished verts/faces into a Blender object, so the
+        viewport never freezes. If no subprocess can be launched we fall back to
+        the in-process two-phase generators ('inproc').
+        """
         s = self._settings
         res = self._levels[self._level_idx]
-        grid = voxelize.build_grid(s, self._depsgraph, resolution=res)
+        self._cur_res = res
+
+        if self._mode == 'solver':
+            try:
+                job = self._build_solver_job(context, res)
+                self._solver = solver_worker.SolverClient()
+                self._solver.start(job)
+                context.scene.blendtopo.status = (
+                    f"voxelizing L{self._level_idx + 1}/{len(self._levels)} "
+                    f"({res}^3)... [bg]")
+                return
+            except Exception as exc:  # noqa: BLE001 - degrade, don't fail
+                print(f"[Blendtopo] subprocess solver unavailable, using "
+                      f"in-process path: {exc}")
+                self._mode = 'inproc'
+                self._solver = None
+
+        # In-process fallback (still chunked, but competes for the main thread).
+        self._grid = None
+        self._gen = None
+        self._voxgen = None
+        self._voxizer = None
+        if voxelize.subprocess_available():
+            try:
+                vx = voxelize.AsyncVoxelizer()
+                vx.start(s, self._depsgraph, resolution=res)
+                self._voxizer = vx
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Blendtopo] async voxelize unavailable: {exc}")
+                self._voxizer = None
+        if self._voxizer is None:
+            self._voxgen = voxelize.build_grid_steps(s, self._depsgraph,
+                                                     resolution=res)
+        self._phase = 'voxel'
+        context.scene.blendtopo.status = (
+            f"voxelizing L{self._level_idx + 1}/{len(self._levels)} "
+            f"({res}^3)...")
+
+    def _build_solver_job(self, context, res):
+        """Assemble the (small) job for the unified solver subprocess: extract
+        each object's triangles (cheap bpy work) plus SIMP params and the
+        warm-start payload from the previous level."""
+        s = self._settings
+        grid, _reach = voxelize._grid_and_reach(s, resolution=res)
+        self._last_vsize = float(grid.vsize)
+        self._depsgraph.update()
+
+        queries, descr = [], []
+        v, f = voxelize._object_triangles(s.build_space, self._depsgraph)
+        queries.append({'verts': v, 'faces': f, 'target': 'centers'})
+        descr.append(('build', None))
+        for item in s.exclude:
+            if item.obj is None:
+                continue
+            v, f = voxelize._object_triangles(item.obj, self._depsgraph)
+            queries.append({'verts': v, 'faces': f, 'target': 'centers'})
+            descr.append(('exclude', None))
+        for b in s.bearings:
+            if b.obj is None:
+                continue
+            v, f = voxelize._object_triangles(b.obj, self._depsgraph)
+            queries.append({'verts': v, 'faces': f, 'target': 'nodes'})
+            descr.append(('bearing', (bool(b.fix_x), bool(b.fix_y),
+                                      bool(b.fix_z))))
+        for ld in s.loads:
+            if ld.obj is None:
+                continue
+            v, f = voxelize._object_triangles(ld.obj, self._depsgraph)
+            queries.append({'verts': v, 'faces': f, 'target': 'nodes'})
+            descr.append(('load', np.asarray(ld.force, dtype=float)))
+
+        is_final = self._level_idx == len(self._levels) - 1
+        tol = 0.0 if is_final else s.convergence_tol
+        return {
+            'direction': voxelize.inside_worker._RAY_DIR,
+            'grid': {'dims': (grid.nx, grid.ny, grid.nz),
+                     'origin': np.asarray(grid.origin, dtype=float),
+                     'vsize': float(grid.vsize)},
+            'queries': queries, 'descr': descr,
+            'simp': {'volfrac': s.volume_fraction, 'penalty': s.penalty,
+                     'rmin': s.filter_radius, 'nu': s.poisson,
+                     'e0': s.youngs_modulus, 'use_multigrid': s.use_multigrid,
+                     'compute_mode': s.compute_mode,
+                     'cpu_threads': int(s.cpu_threads),
+                     'verbose': bool(s.verbose_log),
+                     'max_iter': s.iters_per_level, 'tol': tol},
+            'iso': float(s.iso_level), 'style': s.preview_style,
+            'warm': self._prev or {},
+        }
+
+    def _setup_solve(self, context, grid):
+        """Grid is ready: build the Problem and the SIMP generator for it."""
+        s = self._settings
+        res = self._levels[self._level_idx]
         if grid.active.sum() == 0:
             raise RuntimeError("No active voxels - check build space / resolution")
         if grid.fixed_dofs.size == 0:
@@ -227,42 +357,34 @@ class TO_OT_run(Operator):
             grid.nx, grid.ny, grid.nz, active3d, grid.fixed_dofs, grid.force,
             volfrac=s.volume_fraction, penalty=s.penalty,
             rmin=s.filter_radius, nu=s.poisson, e0=s.youngs_modulus,
-            use_gpu=s.use_gpu, use_multigrid=s.use_multigrid,
+            use_multigrid=s.use_multigrid, compute_mode=s.compute_mode,
+            cpu_threads=int(s.cpu_threads), verbose=bool(s.verbose_log),
         )
 
-        li, res_v, n_iters = self._level_idx, res, s.iters_per_level
+        n_iters = s.iters_per_level
         # Final pass runs all iterations (no early stop) for a fully refined
         # result; coarse passes still early-stop on Convergence for speed.
         is_final = self._level_idx == len(self._levels) - 1
         tol = 0.0 if is_final else s.convergence_tol
-        q, stop = self._q, self._stop
 
-        def work():
-            try:
-                for it, comp, change, rho in prob.optimize(
-                        max_iter=n_iters, x_init=x_init, tol=tol, u_init=u_init):
-                    q.put(('iter', li, res_v, it, comp, change, rho))
-                    if stop.is_set():
-                        break
-                q.put(('level_done', prob.last_u))
-            except Exception as exc:  # noqa: BLE001
-                q.put(('error', str(exc)))
-
-        self._worker = threading.Thread(target=work, daemon=True)
-        self._worker.start()
+        # The generator yields (it, compliance, change, rho) per iteration. We
+        # keep it and step it from the modal timer (main thread); no threads.
+        self._prob = prob
+        self._gen = prob.optimize(
+            max_iter=n_iters, x_init=x_init, tol=tol, u_init=u_init)
+        self._phase = 'solve'
 
     def modal(self, context, event):
         s = context.scene.blendtopo
 
         if event.type == 'ESC' and event.value == 'PRESS':
-            self._stop.set()
             self._interrupted = True
             s.status = "stopping (keeping latest)..."
             return {'RUNNING_MODAL'}
 
         if event.type == 'TIMER':
             try:
-                self._drain(context)
+                self._step(context)
             except Exception as exc:  # noqa: BLE001
                 self._error = str(exc)
                 self.report({'ERROR'}, str(exc))
@@ -272,32 +394,197 @@ class TO_OT_run(Operator):
 
         return {'PASS_THROUGH'}
 
-    def _drain(self, context):
+    def _step(self, context):
+        """Advance the run by one timer tick.
+
+        In 'solver' mode this is just a non-blocking poll of the subprocess plus
+        (at most) building one finished preview mesh - the only main-thread work.
+        In 'inproc' mode it advances the in-process generators as before.
+        """
+        if self._mode == 'solver':
+            self._step_solver(context)
+            return
+
         s = context.scene.blendtopo
+        if self._interrupted:
+            if self._prob is not None:
+                self._prob.close()
+                self._prob = None
+            self._on_level_done(context)
+            return
+
+        if self._phase == 'voxel':
+            self._step_voxelize(context)
+            return
+
         n_levels = len(self._levels)
-        redraw = False
-        while True:
-            try:
-                msg = self._q.get_nowait()
-            except queue.Empty:
-                break
-            tag = msg[0]
-            if tag == 'iter':
-                _, li, res, it, comp, change, rho = msg
-                self._last_rho = rho
-                s.current_iter = it
-                s.status = (f"L{li + 1}/{n_levels} ({res}^3)  it {it}  "
-                            f"C={comp:.3e}  d={change:.3f}")
-                self._emit_result(context, rho, li, it)
-                redraw = True
+        try:
+            it, comp, change, rho = next(self._gen)
+        except StopIteration:
+            # Level finished: keep its displacement field for the next level's
+            # warm start, then move on (or finish).
+            self._prev_u = self._prob.last_u
+            self._prob.close()   # release any multi-CPU/multi-GPU pool
+            self._on_level_done(context)
+            return
+
+        res = self._levels[self._level_idx]
+        self._last_rho = rho
+        s.current_iter = it
+        s.status = (f"L{self._level_idx + 1}/{n_levels} ({res}^3)  it {it}  "
+                    f"C={comp:.3e}  d={change:.3f}")
+        self._emit_result(context, rho, self._level_idx, it)
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+    # -- solver (subprocess) mode -------------------------------------------
+
+    def _step_solver(self, context):
+        """One tick in subprocess mode: poll, and at most build one preview."""
+        s = context.scene.blendtopo
+
+        # On ESC ask the worker to stop after its current iteration; it will
+        # still flush the latest step + final cache, so the result is kept.
+        if self._interrupted and not self._stop_requested:
+            self._solver.request_stop()
+            self._stop_requested = True
+
+        ev, payload = self._solver.poll()
+        n_levels = len(self._levels)
+        res = self._cur_res
+
+        if ev == 'error':
+            raise RuntimeError(payload)
+
+        if ev == 'voxel':
+            pct = 100.0 * float(payload)
+            s.status = (f"voxelizing L{self._level_idx + 1}/{n_levels} "
+                        f"({res}^3)  {pct:.0f}% [bg]")
+        elif ev == 'step':
+            it = int(payload['it'])
+            s.current_iter = it
+            s.status = (f"L{self._level_idx + 1}/{n_levels} ({res}^3)  it {it}  "
+                        f"C={payload['compliance']:.3e}  "
+                        f"d={payload['change']:.3f} [bg]")
+            self._emit_step(context, payload)
+        elif ev == 'done':
+            self._store_cache(payload)
+            self._solver.cleanup()
+            self._solver = None
+            self._advance_or_finish(context)
+
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+    def _emit_step(self, context, payload):
+        """Turn streamed verts/faces into a Blender object (the only main-thread
+        work). Mirrors _emit_result's keep-steps / discard-empty behaviour."""
+        s = context.scene.blendtopo
+        verts, faces = payload['verts'], payload['faces']
+        it, level = int(payload['it']), self._level_idx
+        prev_name = self._last_obj_name
+        if s.keep_steps:
+            name = f"Blendtopo_r{self._run_id}_L{level + 1}_it{it:03d}"
+        else:
+            name = "Blendtopo_Result"
+
+        obj = extract.mesh_to_object(verts, faces, name, collection=self._coll)
+        has_geometry = len(obj.data.polygons) > 0
+
+        # Early iterations can mesh to nothing; don't blank the viewport.
+        if not has_geometry and s.keep_steps and prev_name and prev_name != obj.name:
+            me = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if me.users == 0:
+                bpy.data.meshes.remove(me)
+            return
+
+        if has_geometry and s.keep_steps and prev_name and prev_name != obj.name:
+            prev = bpy.data.objects.get(prev_name)
+            if prev is not None:
+                try:
+                    prev.hide_set(True)
+                except Exception:
+                    prev.hide_viewport = True
+        self._last_obj_name = obj.name
+
+    def _store_cache(self, payload):
+        """Stash the finished level's density/displacement as the warm start for
+        the next level and as the Continue cache."""
+        rho3d = payload.get('rho3d')
+        u = payload.get('u')
+        origin = payload.get('origin')
+        vsize = payload.get('vsize')
+        dims = payload.get('dims')
+        node_dims = payload.get('node_dims')
+        self._last_vsize = float(vsize) if vsize is not None else self._last_vsize
+        if rho3d is not None:
+            self._prev = {'prev_rho3d': rho3d, 'prev_origin': origin,
+                          'prev_vsize': vsize, 'prev_u': u,
+                          'prev_node_dims': node_dims}
+            self._cache_final = {'dims': dims, 'origin': origin, 'vsize': vsize,
+                                 'rho3d': rho3d, 'u': u, 'node_dims': node_dims}
+
+    def _advance_or_finish(self, context):
+        """Move to the next level, or end the run (solver mode)."""
+        if self._interrupted:
+            self._all_done = True
+            return
+        self._level_idx += 1
+        if self._level_idx >= len(self._levels):
+            self._all_done = True
+        else:
+            context.scene.blendtopo.status = "voxelizing next level..."
+            self._start_level(context)
+
+    def _step_voxelize(self, context):
+        """Advance voxelization for one timer tick, then return so Blender can
+        redraw. With the AsyncVoxelizer this is just a non-blocking poll (the
+        actual work runs in another process); with the in-process fallback it
+        drains the generator under a small time budget. Either way the UI stays
+        responsive and shows a progress %."""
+        s = context.scene.blendtopo
+
+        if self._voxizer is not None:
+            tag, payload = self._voxizer.poll()
+            if tag == 'grid':
+                self._voxizer = None
+                self._setup_solve(context, payload)     # -> phase 'solve'
             elif tag == 'error':
-                raise RuntimeError(msg[1])
-            elif tag == 'level_done':
-                self._prev_u = msg[1] if len(msg) > 1 else None
-                self._on_level_done(context)
-        if redraw:
+                self._voxizer = None
+                raise RuntimeError(payload)
+            else:   # 'running'
+                pct = 100.0 * float(payload)
+                res = self._levels[self._level_idx]
+                s.status = (f"voxelizing L{self._level_idx + 1}/"
+                            f"{len(self._levels)} ({res}^3)  {pct:.0f}% [bg]")
             for area in context.screen.areas:
                 area.tag_redraw()
+            return
+
+        budget = 0.02            # seconds of work per timer tick
+        t0 = time.perf_counter()
+        while True:
+            try:
+                tag, *rest = next(self._voxgen)
+            except StopIteration:
+                raise RuntimeError("voxelization produced no grid")
+            if tag == 'grid':
+                self._voxgen = None
+                self._setup_solve(context, rest[0])     # -> phase 'solve'
+                for area in context.screen.areas:
+                    area.tag_redraw()
+                return
+            # tag == 'progress': (done_points, total_points)
+            if time.perf_counter() - t0 >= budget:
+                done_pts, total_pts = rest
+                pct = (100.0 * done_pts / total_pts) if total_pts else 0.0
+                res = self._levels[self._level_idx]
+                s.status = (f"voxelizing L{self._level_idx + 1}/"
+                            f"{len(self._levels)} ({res}^3)  {pct:.0f}% [main]")
+                for area in context.screen.areas:
+                    area.tag_redraw()
+                return
 
     def _on_level_done(self, context):
         self._prev_grid = self._grid
@@ -352,7 +639,16 @@ class TO_OT_run(Operator):
     def _finish(self, context):
         s = context.scene.blendtopo
         wm = context.window_manager
-        self._stop.set()
+        self._gen = None
+        # Kill any still-running subprocess and clean its tmp files.
+        for attr in ("_voxizer", "_solver"):
+            obj_ = getattr(self, attr, None)
+            if obj_ is not None:
+                try:
+                    obj_.cancel()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         if getattr(self, "_timer", None) is not None:
             wm.event_timer_remove(self._timer)
             self._timer = None
@@ -361,7 +657,10 @@ class TO_OT_run(Operator):
         if obj is not None and not self._interrupted and not self._error:
             # Guarantee a single watertight shell on the finished result.
             extract.finalize_watertight(obj)
-            vox = self._grid.vsize * 0.75 if s.preview_style == 'BLOCKY' else None
+            # Voxel size: from the live grid (in-proc) or the last level (solver).
+            vsize = self._grid.vsize if self._grid is not None else self._last_vsize
+            vox = (vsize * 0.75 if (s.preview_style == 'BLOCKY' and vsize)
+                   else None)
             extract.apply_remesh_smooth(
                 obj, voxel_size=vox, smooth_iters=s.smooth_iterations)
         if self._error:
@@ -372,11 +671,19 @@ class TO_OT_run(Operator):
             s.status = f"done at iter {s.current_iter}"
         # Cache the finest result so "Continue" can resume more iterations.
         global _RESUME_CACHE
-        if (not self._error and self._prev_grid is not None
-                and self._prev_rho3d is not None):
-            _RESUME_CACHE = {'grid': self._prev_grid,
-                             'rho3d': self._prev_rho3d, 'u': self._prev_u,
-                             'last_obj': self._last_obj_name}
+        if not self._error and self._cache_final is not None:
+            # Preferred: raw fields captured from the solver's final payload.
+            _RESUME_CACHE = dict(self._cache_final)
+            _RESUME_CACHE['last_obj'] = self._last_obj_name
+        elif (not self._error and self._prev_grid is not None
+              and self._prev_rho3d is not None):
+            # In-process fallback path: derive the same raw fields from the grid.
+            g = self._prev_grid
+            _RESUME_CACHE = {
+                'dims': (g.nx, g.ny, g.nz), 'origin': np.asarray(g.origin),
+                'vsize': float(g.vsize), 'rho3d': self._prev_rho3d,
+                'u': self._prev_u, 'node_dims': (g.nx + 1, g.ny + 1, g.nz + 1),
+                'last_obj': self._last_obj_name}
         self.report({'INFO'}, s.status)
         for area in context.screen.areas:
             area.tag_redraw()
@@ -449,5 +756,10 @@ def register():
 
 
 def unregister():
+    # Guard against a class never having been registered (e.g. register()
+    # aborted partway through -- Blender then still calls unregister() on
+    # every module as cleanup, which would otherwise raise "missing bl_rna
+    # attribute ... may not be registered").
     for cls in reversed(_CLASSES):
-        bpy.utils.unregister_class(cls)
+        if hasattr(cls, "bl_rna"):
+            bpy.utils.unregister_class(cls)
