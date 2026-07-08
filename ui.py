@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Sidebar UI for Blendtopo (View3D > N panel)."""
 
+import os
+
 import bpy
 from bpy.types import Panel
 
-from .core.fea import gpu_status, gpu_usable
+from .core.backend import is_gpu_build, gpu_status, gpu_usable, gpu_device_count
 
 
 class TO_PT_base:
@@ -56,7 +58,9 @@ class TO_PT_bc(TO_PT_base, Panel):
             op.collection_name = "bearings"
             op.index = i
             r2 = col.row(align=True)
-            r2.prop(b, "fix_x"); r2.prop(b, "fix_y"); r2.prop(b, "fix_z")
+            r2.prop(b, "fix_x")
+            r2.prop(b, "fix_y")
+            r2.prop(b, "fix_z")
 
         box = layout.box()
         box.label(text="Loads (forces)", icon='FORCE_FORCE')
@@ -87,9 +91,30 @@ class TO_PT_settings(TO_PT_base, Panel):
         col.prop(s, "convergence_tol")
         col.prop(s, "volume_fraction", slider=True)
         col.prop(s, "use_multigrid")
-        col.prop(s, "use_gpu")
-        col.label(text=gpu_status(),
-                  icon='CHECKMARK' if gpu_usable() else 'INFO')
+
+        box = layout.box()
+        header = box.row(align=True)
+        header.prop(s, "show_compute_advanced",
+                    icon='TRIA_DOWN' if s.show_compute_advanced else 'TRIA_RIGHT',
+                    icon_only=True, emboss=False)
+        header.prop(s, "compute_mode")
+        if s.show_compute_advanced:
+            col = box.column(align=True)
+            threads_text = ("CPU Threads: 0 (auto)" if s.cpu_threads == 0
+                            else "CPU Threads")
+            col.prop(s, "cpu_threads", text=threads_text)
+            cores = os.cpu_count() or 1
+            col.label(text=f"CPU: {cores} logical cores detected",
+                      icon='INFO')
+            # GPU status is only ever meaningful in the GPU edition -- the
+            # CPU/hosted build never shows anything GPU-related here.
+            if is_gpu_build():
+                n_gpu = gpu_device_count() if gpu_usable() else 0
+                col.label(text=gpu_status(),
+                          icon='CHECKMARK' if gpu_usable() else 'INFO')
+                if gpu_usable():
+                    col.label(text=f"GPU devices visible: {n_gpu}")
+            col.prop(s, "verbose_log")
 
         col = layout.column(align=True)
         col.prop(s, "penalty")
@@ -150,5 +175,10 @@ def register():
 
 
 def unregister():
+    # Guard against a class never having been registered (e.g. register()
+    # aborted partway through -- Blender then still calls unregister() on
+    # every module as cleanup, which would otherwise raise "missing bl_rna
+    # attribute ... may not be registered").
     for cls in reversed(_CLASSES):
-        bpy.utils.unregister_class(cls)
+        if hasattr(cls, "bl_rna"):
+            bpy.utils.unregister_class(cls)
