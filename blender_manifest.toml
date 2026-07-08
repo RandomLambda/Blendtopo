@@ -1,8 +1,8 @@
 schema_version = "1.0.0"
 
 id = "blendtopo"
-version = "1.1.1"
-name = "Blendtopo - Topology Optimization"
+version = "1.0.0"
+name = "Blendtopo - Topology Optimization (GPU)"
 tagline = "SIMP topology optimization for solid mesh parts"
 maintainer = "Philip Gruenenfelder"
 type = "add-on"
@@ -28,6 +28,8 @@ platforms = ["windows-x64", "windows-arm64", "macos-x64", "macos-arm64", "linux-
 # threadpoolctl (pure-python, one wheel for every platform) lets the solver
 # size numpy's BLAS thread pool at runtime -- see core/compute_plan.py.
 wheels = [
+    "./wheels/cupy_cuda12x-14.1.1-cp311-cp311-manylinux2014_x86_64.whl",
+    "./wheels/cupy_cuda12x-14.1.1-cp311-cp311-win_amd64.whl",
     "./wheels/trimesh-4.12.2-py3-none-any.whl",
     "./wheels/rtree-1.4.1-py3-none-win_amd64.whl",
     "./wheels/rtree-1.4.1-py3-none-win_arm64.whl",
