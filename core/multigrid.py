@@ -16,12 +16,57 @@ hierarchy cannot be built (odd/small dims) it degrades to single-level
 Jacobi-PCG, identical to fea.solve.
 
 Works on the full regular grid (void elements carry e_min stiffness). Pure
-numpy; uses cupy transparently if an array module is passed in.
+numpy, no external dependencies.
+
+multi_gpu xp history (real-hardware benchmark timeline, 2x GTX 970, see
+paper/experiments/benchmark_multigpu.py) -- kept here because the reasoning
+that turned out to be WRONG is exactly the kind of thing worth not
+re-discovering the hard way a third time:
+
+  Round 1: self.xp was numpy for every "parallel" plan (multi_gpu/multi_cpu),
+  copying fea.VoxelFEA's rule, AND the V-cycle smoother was routed through
+  the pool along with the outer CG matvec. Multi-GPU was 1.5x-3.5x SLOWER
+  than single-GPU. Root cause: routing smoothing through the pool (~5 pooled
+  calls/iteration instead of ~2), each paying a full host round-trip per
+  device for work too small to amortize. Fix: split MGSolver._apply (local,
+  never pooled) from _apply_pooled (outer CG only, pooled).
+
+  Round 2 (after the Round 1 fix + streams/pinned-memory in
+  parallel_gpu_domain.py): self.xp still numpy. Small problems got much
+  faster (~8x vs single-GPU), but large problems got WORSE (~6.5x slower,
+  1,101,411 DOF, GPU utilization measured <30%). Hypothesis at the time:
+  the now-un-pooled local smoothing, forced onto single-threaded host numpy,
+  had become the bottleneck -- so self.xp was changed to
+  backend.get_xp(True) (Cu-Py, single device) for multi_gpu, keeping only
+  _apply_pooled's host round-trip to reach the multi-device pool.
+
+  Round 3 (testing the Round 2 hypothesis): multi-GPU got WORSE AGAIN
+  (45.6s vs 19.6s at the same 1.1M-DOF case) -- disproving the hypothesis.
+  Two likely compounding causes: (1) Cu-Py's bincount is a scatter-add with
+  colliding indices (shared FEA nodes between elements), which leans on
+  atomics that apparently do not parallelize well on this hardware -- host
+  numpy's bincount was actually faster per call, not slower; (2) forcing
+  xp=Cu-Py added two extra full-vector D2H/H2D copies per _apply_pooled call
+  (backend.asnumpy(u) / xp.asarray(...) around the pool -- a no-op when xp
+  is already numpy, real transfers when it isn't) that Round 2 did not pay.
+  Reverted self.xp back to numpy for every parallel plan (Round 2's rule).
+
+  Status: Round 2's number (19.6s vs 3.0s single-GPU, ~6.5x slower) is the
+  current best-known state for large multi-GPU problems, and its own root
+  cause is still NOT identified -- "obviously it must be X" has now been
+  wrong twice in a row for this file. MGSolver.solve() gained wall-clock
+  instrumentation (self._t_pooled / self._t_local, printed when verbose)
+  instead of a third guess; run benchmark_multigpu.py with "Verbose solver
+  log" enabled and read the printed breakdown before changing this again.
 """
+
+import time
 
 import numpy as np
 
 from .fea import _hex8_KE, build_edof
+from . import backend
+from . import compute_plan
 
 
 def _node_dims(nx, ny, nz):
@@ -66,18 +111,68 @@ class MGSolver:
     """Multigrid-preconditioned CG on the full voxel grid."""
 
     def __init__(self, nx, ny, nz, fixed_dofs, nu=0.3, xp=None,
-                 n_smooth=2, omega=0.6, min_elems=4, max_levels=6):
-        self.xp = xp if xp is not None else np
-        xp = self.xp
+                 n_smooth=2, omega=0.6, min_elems=4, max_levels=6,
+                 compute_mode="AUTO", cpu_threads=0, verbose=False):
         self.nx, self.ny, self.nz = nx, ny, nz
         self.nelem = nx * ny * nz
         self.ndof = 3 * (nx + 1) * (ny + 1) * (nz + 1)
         self.n_smooth = n_smooth
         self.omega = omega
+        self.verbose = verbose
+        self._pool = None
+
+        # Wall-clock accounting, reset at the start of every solve() call and
+        # printed at the end when verbose -- added after two rounds of real-
+        # hardware multi-GPU benchmarking produced numbers that contradicted
+        # each other's implied diagnosis (see "multi_gpu xp history" in the
+        # module docstring): guessing which part of the V-cycle is actually
+        # slow from aggregate solve_iter timing alone was not reliable enough
+        # to keep iterating blind. These are plain wall-clock sums (not
+        # profiler-grade -- no exclusion of Python overhead between calls),
+        # but they are enough to tell whether time is going into the pooled
+        # multi-device matvec (_t_pooled) or the un-pooled local V-cycle work
+        # that runs on every level (_t_local, covering _apply/_smooth plus
+        # _restrict/_prolongate).
+        self._t_pooled = 0.0
+        self._t_local = 0.0
+        self._n_pooled_calls = 0
+        self._n_local_calls = 0
+
+        # Same threshold-based plan as fea.VoxelFEA, evaluated on the full
+        # (level-0) grid's DOF count. Only level 0 -- the one actually
+        # touched every V-cycle smoothing pass -- is ever parallelized;
+        # coarser levels are tiny by construction (built by halving until
+        # min_elems) so a pool there would be pure overhead.
+        if xp is not None:
+            # Caller pinned an array module explicitly (e.g. tests): honour
+            # it and skip the auto plan/pool entirely.
+            self.xp = xp
+            self.plan = None
+        else:
+            self.plan = compute_plan.choose(self.ndof, mode=compute_mode,
+                                            cpu_threads=cpu_threads,
+                                            verbose=verbose)
+            # REVERTED (see "multi_gpu xp history" below): a prior version of
+            # this file forced self.xp = backend.get_xp(True) (Cu-Py) here,
+            # reasoning that host numpy was the bottleneck for the un-pooled
+            # local V-cycle work. Measured on real hardware that made things
+            # WORSE (45.6s vs 19.6s at 1.1M DOF) -- so that reasoning was
+            # wrong: Cu-Py's bincount (scatter-add with colliding indices,
+            # exactly what FEA assembly is) leans on atomics that don't
+            # parallelize well on this hardware, and forcing xp=Cu-Py also
+            # added two extra full-vector D2H/H2D copies per _apply_pooled
+            # call (backend.asnumpy(u) / xp.asarray(...) around the pool,
+            # which is a no-op when xp is already numpy) that weren't there
+            # before. Back to plain numpy for ALL parallel plans, matching
+            # fea.VoxelFEA -- see "multi_gpu xp history" below for the still-
+            # unexplained 19.6s-vs-3.0s gap this does NOT fix.
+            self.xp = np if self.plan.parallel else self.plan.xp
+        xp = self.xp
 
         KE = _hex8_KE(E=1.0, nu=nu)
         self.KE = xp.asarray(KE)
         self.diagKE = xp.asarray(np.diag(KE))
+        self._KE_host = KE
 
         # Build the grid hierarchy (each level 2x coarser) while dims stay even.
         self.levels = []
@@ -110,6 +205,71 @@ class MGSolver:
             self.prolong.append(_prolong_op(fdims, cdims, xp))
 
         self._build_free(fixed_dofs)
+
+        if self.plan is not None:
+            self._init_pool()
+
+    def _init_pool(self):
+        """Build the level-0 matvec pool if the plan calls for one, falling
+        back one rung if it fails to construct (never lets a broken
+        accelerator abort the solve -- see fea.VoxelFEA._init_pool, same
+        pattern)."""
+        plan = self.plan
+        lv0 = self.levels[0]
+        edof0_host = backend.asnumpy(lv0['edof'])
+        if plan.kind == "multi_cpu":
+            from . import parallel_cpu
+            try:
+                self._pool = parallel_cpu.CPUMatVecPool(
+                    edof0_host, self._KE_host, lv0['ndof'], plan.n_workers,
+                    verbose=self.verbose)
+                return
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[Blendtopo] MG: multi-CPU pool unavailable "
+                          f"({exc}); using single-process CPU")
+                self.plan = compute_plan.ComputePlan(
+                    "cpu", np, 1, "CPU (multi-CPU fallback)")
+        elif plan.kind == "multi_gpu":
+            # Domain-decomposed pool first (core/parallel_gpu_domain.py, a
+            # separate opt-in file -- see its module docstring): only every
+            # device's own DOF slice is ever transferred, instead of the
+            # full vector to every device. Only valid for the FULL regular
+            # grid (level 0 always is), so it always applies here. Falls
+            # back to the plain broadcast pool, then single GPU/CPU, exactly
+            # like the multi-CPU branch above -- a broken/unavailable
+            # accelerator must never abort the solve, only make it slower.
+            from . import parallel_gpu_domain
+            try:
+                self._pool = parallel_gpu_domain.DomainGPUMatVecPool(
+                    edof0_host, self._KE_host, lv0['ndof'], plan.n_workers,
+                    dims=lv0['dims'], verbose=self.verbose)
+                return
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[Blendtopo] MG: domain-decomposed multi-GPU pool "
+                          f"unavailable ({exc}); trying plain multi-GPU pool")
+            from . import parallel_gpu
+            try:
+                self._pool = parallel_gpu.GPUMatVecPool(
+                    edof0_host, self._KE_host, lv0['ndof'], plan.n_workers,
+                    verbose=self.verbose)
+                return
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[Blendtopo] MG: multi-GPU pool unavailable "
+                          f"({exc}); using single GPU/CPU")
+                self.plan = compute_plan.choose(
+                    lv0['ndof'], mode="GPU", verbose=self.verbose)
+
+    def close(self):
+        """Release the level-0 matvec pool's workers/devices, if any."""
+        if self._pool is not None:
+            try:
+                self._pool.close()
+            except Exception:
+                pass
+            self._pool = None
 
     # -- boundary conditions per level --------------------------------------
     def _build_free(self, fixed_dofs):
@@ -150,6 +310,13 @@ class MGSolver:
                 E = pe3.reshape(lx, 2, ly, 2, lz, 2).mean(axis=(1, 3, 5)).ravel()
             lv['Evec'] = E
             scaled = E * lv['g']
+            if li == 0 and self._pool is not None:
+                # Keep the pool's density in sync (needed by _apply_pooled),
+                # but compute the diagonal locally -- it's one O(nelem) call
+                # per SIMP iteration, not per CG/smoothing iteration, so
+                # there's nothing to gain from splitting it, and it avoids
+                # one more host round-trip on the hot path.
+                self._pool.set_density(backend.asnumpy(scaled))
             d = xp.bincount(lv['edof'].ravel(),
                             weights=(scaled[:, None] * self.diagKE[None, :]).ravel(),
                             minlength=lv['ndof'])
@@ -159,18 +326,63 @@ class MGSolver:
 
     # -- operators ----------------------------------------------------------
     def _apply(self, li, u):
+        """Local (never pooled) matrix-free apply. Used by the V-cycle
+        smoother/residual (_smooth, _vcycle) -- called ~5x per outer CG
+        iteration just at level 0 alone (n_smooth pre- + post-smoothing
+        passes, plus the V-cycle's own residual). Splitting *this* across
+        devices/processes was the actual cause of a measured 1.5-3.5x
+        MULTI-GPU SLOWDOWN vs. single-GPU on real hardware (2x GTX 970,
+        see paper/experiments/benchmark_multigpu.py): each smoothing pass
+        paid a full host round-trip on every device, for work too small
+        and too frequent to amortize that cost. See _apply_pooled for the
+        one call site that's actually meant to be split.
+
+        Wall-clock time spent here (across the whole solve() call, all
+        levels combined) accumulates into self._t_local -- see "multi_gpu
+        xp history" in the module docstring for why this instrumentation
+        was added instead of another guess."""
+        t0 = time.perf_counter()
         xp = self.xp
         lv = self.levels[li]
         ue = u[lv['edof']]
         ke = (ue @ self.KE.T) * lv['_scaled'][:, None]
         Ku = xp.bincount(lv['edof'].ravel(), weights=ke.ravel(),
                          minlength=lv['ndof'])
-        return xp.where(lv['free'], Ku, 0.0)
+        out = xp.where(lv['free'], Ku, 0.0)
+        self._t_local += time.perf_counter() - t0
+        self._n_local_calls += 1
+        return out
+
+    def _apply_pooled(self, u):
+        """The level-0 operator application as called directly by the
+        outer CG loop in solve() (initial residual + Ap) -- ~2x per outer
+        CG iteration, not per smoothing pass, so it's the one call site
+        with enough compute per call to be worth splitting across a
+        multi-GPU/multi-CPU pool when the compute plan calls for one.
+
+        Wall-clock time spent here accumulates into self._t_pooled -- see
+        _apply's docstring."""
+        t0 = time.perf_counter()
+        lv = self.levels[0]
+        xp = self.xp
+        if self._pool is not None:
+            Ku = xp.asarray(self._pool.apply(backend.asnumpy(u)))
+        else:
+            ue = u[lv['edof']]
+            ke = (ue @ self.KE.T) * lv['_scaled'][:, None]
+            Ku = xp.bincount(lv['edof'].ravel(), weights=ke.ravel(),
+                             minlength=lv['ndof'])
+        out = xp.where(lv['free'], Ku, 0.0)
+        self._t_pooled += time.perf_counter() - t0
+        self._n_pooled_calls += 1
+        return out
 
     def _smooth(self, li, u, b, iters):
         xp = self.xp
         lv = self.levels[li]
-        free = lv['free']; Minv = lv['Minv']; w = self.omega
+        free = lv['free']
+        Minv = lv['Minv']
+        w = self.omega
         for _ in range(iters):
             r = b - self._apply(li, u)
             u = u + w * xp.where(free, Minv * r, 0.0)
@@ -213,6 +425,11 @@ class MGSolver:
     # -- public solve -------------------------------------------------------
     def solve(self, Evec_full, f, tol=1e-4, max_cg=None, x0=None):
         xp = self.xp
+        t_solve0 = time.perf_counter()
+        self._t_pooled = 0.0
+        self._t_local = 0.0
+        self._n_pooled_calls = 0
+        self._n_local_calls = 0
         self.set_density(Evec_full)
         free = self.levels[0]['free']
         f = xp.asarray(np.asarray(f, dtype=float))
@@ -223,7 +440,7 @@ class MGSolver:
             r = f.copy()
         else:
             u = xp.where(free, xp.asarray(np.asarray(x0, dtype=float)), 0.0)
-            r = f - self._apply(0, u)
+            r = f - self._apply_pooled(u)
         r = xp.where(free, r, 0.0)
 
         fnorm = float(xp.linalg.norm(f))
@@ -235,7 +452,7 @@ class MGSolver:
         max_cg = max_cg or 200
         self.last_iters = 0
         for it in range(max_cg):
-            Ap = self._apply(0, p)
+            Ap = self._apply_pooled(p)
             alpha = rz / float(p @ Ap)
             u = u + alpha * p
             r = r - alpha * Ap
@@ -247,4 +464,17 @@ class MGSolver:
             p = z + (rz_new / rz) * p
             rz = rz_new
         u = xp.where(free, u, 0.0)
+        if self.verbose:
+            t_total = time.perf_counter() - t_solve0
+            t_other = t_total - self._t_pooled - self._t_local
+            pool_label = (self._pool.__class__.__name__
+                          if self._pool is not None else "none (local only)")
+            print(f"[Blendtopo] MG solve: {self.last_iters} CG iters, "
+                  f"total={t_total * 1e3:.1f}ms | "
+                  f"pooled={self._t_pooled * 1e3:.1f}ms "
+                  f"({self._n_pooled_calls} calls via {pool_label}) | "
+                  f"local={self._t_local * 1e3:.1f}ms "
+                  f"({self._n_local_calls} calls, _apply/_smooth across all "
+                  f"levels) | other (CG vector ops, restrict/prolongate, "
+                  f"set_density)={t_other * 1e3:.1f}ms")
         return u if xp is np else xp.asnumpy(u)

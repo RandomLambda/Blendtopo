@@ -115,7 +115,8 @@ class Problem:
 
     def __init__(self, nx, ny, nz, active, fixed_dofs, force,
                  volfrac=0.3, penalty=3.0, rmin=1.5, nu=0.3,
-                 e0=1.0, e_min=1e-9, use_gpu=False, use_multigrid=True):
+                 e0=1.0, e_min=1e-9, use_multigrid=True,
+                 compute_mode="AUTO", cpu_threads=0, verbose=False):
         self.nx, self.ny, self.nz = nx, ny, nz
         self.shape = (nx, ny, nz)
         self.active = active.astype(bool).ravel()      # voxels free to change
@@ -124,25 +125,34 @@ class Problem:
         self.e0 = e0
         self.e_min = e_min
 
-        self.fea = VoxelFEA(nx, ny, nz, nu=nu, e_min=e_min, use_gpu=use_gpu,
-                            active_elems=self.active)
+        self.fea = VoxelFEA(nx, ny, nz, nu=nu, e_min=e_min,
+                            active_elems=self.active, compute_mode=compute_mode,
+                            cpu_threads=cpu_threads, verbose=verbose)
         self.fea.set_fixed(fixed_dofs)
         self.force = np.asarray(force, dtype=float)
 
-        # Optional multigrid solver (full grid). Falls back to fea.solve.
+        # Optional geometric-multigrid solver (full grid). Picks its own
+        # CPU/GPU/multi-* plan for the full-grid DOF count (see
+        # core/compute_plan.py) and falls back to fea.solve if construction
+        # fails outright.
         self.mg = None
         if use_multigrid:
             try:
-                xp = np
-                if use_gpu and getattr(self.fea, "gpu", False):
-                    import cupy as cp
-                    xp = cp
-                self.mg = MGSolver(nx, ny, nz, fixed_dofs, nu=nu, xp=xp)
+                self.mg = MGSolver(nx, ny, nz, fixed_dofs, nu=nu,
+                                   compute_mode=compute_mode,
+                                   cpu_threads=cpu_threads, verbose=verbose)
             except Exception:
                 self.mg = None
 
         self._offsets = _build_filter(nx, ny, nz, rmin)
         self.last_u = None
+
+    def close(self):
+        """Release any multi-CPU/multi-GPU pools started for this problem."""
+        if self.fea is not None:
+            self.fea.close()
+        if self.mg is not None:
+            self.mg.close()
 
     def _filter_sens(self, rho, dc):
         """Sensitivity filter (Sigmund): smooths dc, weighted by rho."""

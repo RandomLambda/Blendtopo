@@ -170,7 +170,6 @@ def surface_nets(density3d, iso, origin, vsize):
         faces.append([a, b, c, d] if flip else [d, c, b, a])
 
     # x-edges interior in (y,z): link cells (i, j-1..j, k-1..k)
-    solid = S >= iso
     xs = np.argwhere(Mx[:, 1:cy, 1:cz])  # j,k shifted by +1
     for i, jj, kk in xs:
         j, k = jj + 1, kk + 1
@@ -199,19 +198,27 @@ def surface_nets(density3d, iso, origin, vsize):
 # Blender object building
 # ---------------------------------------------------------------------------
 
-def density_to_object(density3d, iso, origin, vsize, name,
-                      style='SMOOTH', collection=None, world_matrix=None):
-    """Create (or reuse) a Blender mesh object from a density field."""
-    if not _HAS_BPY:
-        raise RuntimeError("density_to_object requires Blender")
+def mesh_to_object(verts, faces, name, collection=None, world_matrix=None):
+    """Create (or reuse) a Blender mesh object from ready-made verts/faces.
 
-    if style == 'BLOCKY':
-        verts, faces = cubes_from_density(density3d, iso, origin, vsize)
+    This is the *only* step that must run on Blender's main thread; the meshing
+    itself (surface_nets / cubes_from_density) is pure numpy and can be done in
+    a worker process, which then streams the verts/faces here. ``verts`` may be
+    an (N,3) array; ``faces`` an (M,k) array or a list of index sequences.
+    """
+    if not _HAS_BPY:
+        raise RuntimeError("mesh_to_object requires Blender")
+
+    import numpy as _np
+    verts = _np.asarray(verts, dtype=float)
+    vlist = verts.tolist() if len(verts) else []
+    if isinstance(faces, _np.ndarray):
+        flist = faces.tolist()
     else:
-        verts, faces = surface_nets(density3d, iso, origin, vsize)
+        flist = [list(f) for f in faces]
 
     mesh = bpy.data.meshes.new(name + "_mesh")
-    mesh.from_pydata([tuple(v) for v in verts], [], faces)
+    mesh.from_pydata(vlist, [], flist)
     mesh.update()
     # Smooth shading + consistent normals for a clean preview.
     try:
@@ -235,6 +242,21 @@ def density_to_object(density3d, iso, origin, vsize, name,
     if world_matrix is not None:
         obj.matrix_world = world_matrix
     return obj
+
+
+def density_to_object(density3d, iso, origin, vsize, name,
+                      style='SMOOTH', collection=None, world_matrix=None):
+    """Create (or reuse) a Blender mesh object from a density field."""
+    if not _HAS_BPY:
+        raise RuntimeError("density_to_object requires Blender")
+
+    if style == 'BLOCKY':
+        verts, faces = cubes_from_density(density3d, iso, origin, vsize)
+    else:
+        verts, faces = surface_nets(density3d, iso, origin, vsize)
+
+    return mesh_to_object(verts, faces, name, collection=collection,
+                          world_matrix=world_matrix)
 
 
 def finalize_watertight(obj):

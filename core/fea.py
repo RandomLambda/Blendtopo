@@ -9,13 +9,19 @@ assembling a global sparse matrix (keeps us scipy-free).
 
 The solve is restricted to elements that actually exist (inside the build
 space): only their nodes get DOFs, so empty margin around the part costs
-nothing. Optionally runs on the GPU via CuPy.
+nothing. All array work goes through the compute backend (``core.backend``):
+the hosted edition's backend is pure numpy, while the optional GPU edition's
+backend can route the same code onto a GPU array library. The maths is identical
+either way.
 
 DOF numbering (original/full space): node n has DOFs [3n, 3n+1, 3n+2].
 Grid nodes: (nx+1)*(ny+1)*(nz+1) for an nx*ny*nz element grid.
 """
 
 import numpy as np
+
+from . import backend
+from . import compute_plan
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +66,12 @@ def _hex8_KE(E=1.0, nu=0.3):
                     B[0, c0] = bx
                     B[1, c0 + 1] = by
                     B[2, c0 + 2] = bz
-                    B[3, c0] = by; B[3, c0 + 1] = bx
-                    B[4, c0 + 1] = bz; B[4, c0 + 2] = by
-                    B[5, c0] = bz; B[5, c0 + 2] = bx
+                    B[3, c0] = by
+                    B[3, c0 + 1] = bx
+                    B[4, c0 + 1] = bz
+                    B[4, c0 + 2] = by
+                    B[5, c0] = bz
+                    B[5, c0 + 2] = bx
                 KE += (B.T @ C @ B) * detJ
     return KE
 
@@ -79,7 +88,9 @@ def build_edof(nx, ny, nz):
     """Return edofMat [nelem, 24] of global DOF indices per element."""
     ex, ey, ez = np.meshgrid(
         np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
-    ex = ex.ravel(); ey = ey.ravel(); ez = ez.ravel()
+    ex = ex.ravel()
+    ey = ey.ravel()
+    ez = ez.ravel()
     offs = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
             (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
     edof = np.empty((ex.size, 24), dtype=np.int64)
@@ -89,85 +100,6 @@ def build_edof(nx, ny, nz):
         edof[:, 3 * k + 1] = 3 * nid + 1
         edof[:, 3 * k + 2] = 3 * nid + 2
     return edof
-
-
-# ---------------------------------------------------------------------------
-# Optional GPU backend
-# ---------------------------------------------------------------------------
-
-def _gpu_backend():
-    """Return the cupy module if a CUDA device is usable, else None."""
-    try:
-        import cupy as cp
-        if cp.cuda.runtime.getDeviceCount() < 1:
-            return None
-        return cp
-    except Exception:
-        return None
-
-
-_GPU_OK = None
-
-
-def _gpu_self_test():
-    """Solve a tiny problem on CPU and GPU; return True only if they agree.
-
-    This guards against any CuPy/driver quirk silently producing a wrong FEA
-    result. If it fails, the GPU is never used and we stay on the proven CPU
-    path (so results are always correct, just maybe slower).
-    """
-    if _gpu_backend() is None:
-        return False
-    try:
-        nx, ny, nz = 6, 3, 3
-
-        def nid(ix, iy, iz):
-            return ix + (nx + 1) * (iy + (ny + 1) * iz)
-
-        fixed = []
-        for iy in range(ny + 1):
-            for iz in range(nz + 1):
-                n = nid(0, iy, iz)
-                fixed += [3 * n, 3 * n + 1, 3 * n + 2]
-        f = np.zeros(3 * (nx + 1) * (ny + 1) * (nz + 1))
-        for iy in range(ny + 1):
-            n = nid(nx, iy, 0)
-            f[3 * n + 2] = -1.0
-        Evec = np.ones(nx * ny * nz)
-
-        cpu = VoxelFEA(nx, ny, nz, use_gpu=False)
-        cpu.set_fixed(fixed)
-        gpu = VoxelFEA(nx, ny, nz, use_gpu=True, _skip_validate=True)
-        gpu.set_fixed(fixed)
-        if not gpu.gpu:
-            return False
-        uc = cpu.solve(Evec, f, tol=1e-8)
-        ug = gpu.solve(Evec, f, tol=1e-8)
-        return bool(np.allclose(uc, ug, rtol=1e-3, atol=1e-9))
-    except Exception:
-        return False
-
-
-def gpu_usable():
-    """Cached: True only if CuPy is present AND passes the CPU/GPU self-test."""
-    global _GPU_OK
-    if _GPU_OK is None:
-        _GPU_OK = _gpu_self_test()
-    return _GPU_OK
-
-
-def gpu_available():
-    """Back-compat alias: only reports usable (validated) GPU."""
-    return gpu_usable()
-
-
-def gpu_status():
-    """Human-readable GPU status for the UI."""
-    if _gpu_backend() is None:
-        return "GPU: CuPy not installed - using CPU"
-    if gpu_usable():
-        return "GPU: CuPy ready (validated)"
-    return "GPU: self-test FAILED - using CPU"
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +116,8 @@ class VoxelFEA:
     per-element array (zeros outside the active region).
     """
 
-    def __init__(self, nx, ny, nz, nu=0.3, e_min=1e-9, use_gpu=False,
-                 active_elems=None, _skip_validate=False):
+    def __init__(self, nx, ny, nz, nu=0.3, e_min=1e-9, active_elems=None,
+                 compute_mode="AUTO", cpu_threads=0, verbose=False):
         self.nx, self.ny, self.nz = nx, ny, nz
         self.nelem = nx * ny * nz
         self.ndof_full = 3 * (nx + 1) * (ny + 1) * (nz + 1)
@@ -210,23 +142,72 @@ class VoxelFEA:
 
         self.free = None
         self._diag = None
+        self.verbose = verbose
 
-        # GPU setup - only if requested AND validated by the self-test.
-        self.gpu = False
-        self.xp = np
-        self.KE_x = self.KE
-        self.edof_x = self.edof
-        if use_gpu and (_skip_validate or gpu_usable()):
-            cp = _gpu_backend()
-            if cp is not None:
-                try:
-                    self.xp = cp
-                    self.KE_x = cp.asarray(self.KE)
-                    self.edof_x = cp.asarray(self.edof)
-                    self.gpu = True
-                except Exception:
-                    self.xp = np; self.gpu = False
-                    self.KE_x = self.KE; self.edof_x = self.edof
+        # Decide CPU / single-GPU / multi-GPU / multi-process-CPU for this
+        # grid's actual (reduced) DOF count -- see core/compute_plan.py for
+        # the thresholds. When the plan is "parallel" (multi_gpu/multi_cpu),
+        # the hot gather-matmul-scatter in _apply_K/_diagonal is delegated to
+        # a pool and the surrounding CG vector ops stay on host numpy (they
+        # are O(ndof), cheap, and the pool already hands back host arrays).
+        # Unlike core/multigrid.py's MGSolver, EVERY matvec here goes through
+        # the pool when one is active (there is no separate, un-pooled "local"
+        # matvec) -- so forcing xp=numpy costs nothing extra. MGSolver's
+        # V-cycle smoother/_restrict/_prolongate deliberately bypass the pool
+        # instead, so it can't reuse this same "parallel -> host" rule; see
+        # MGSolver.__init__ for why it keeps multi_gpu on Cu-Py instead.
+        self.plan = compute_plan.choose(self.ndof, mode=compute_mode,
+                                        cpu_threads=cpu_threads,
+                                        verbose=verbose)
+        self._pool = None
+        self.xp = np if self.plan.parallel else self.plan.xp
+        self._init_pool()
+        self.KE_x = self.xp.asarray(self.KE)
+        self.edof_x = self.xp.asarray(self.edof)
+
+    def _init_pool(self):
+        """Build the multi-worker matvec pool if the plan calls for one,
+        falling back one rung (multi_gpu -> gpu -> cpu, multi_cpu -> cpu) if
+        it fails to construct for any reason -- a failed accelerator must
+        never abort the solve, only make it slower."""
+        plan = self.plan
+        if plan.kind == "multi_cpu":
+            from . import parallel_cpu
+            try:
+                self._pool = parallel_cpu.CPUMatVecPool(
+                    self.edof, self.KE, self.ndof, plan.n_workers,
+                    verbose=self.verbose)
+                return
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[Blendtopo] multi-CPU pool unavailable ({exc}); "
+                          f"falling back to single-process CPU")
+                self.plan = compute_plan.ComputePlan(
+                    "cpu", np, 1, "CPU (multi-CPU fallback)")
+                self.xp = np
+        elif plan.kind == "multi_gpu":
+            from . import parallel_gpu
+            try:
+                self._pool = parallel_gpu.GPUMatVecPool(
+                    self.edof, self.KE, self.ndof, plan.n_workers,
+                    verbose=self.verbose)
+                return
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[Blendtopo] multi-GPU pool unavailable ({exc}); "
+                          f"falling back to single GPU/CPU")
+                self.plan = compute_plan.choose(
+                    self.ndof, mode="GPU", verbose=self.verbose)
+                self.xp = self.plan.xp
+
+    def close(self):
+        """Release the matvec pool's workers/devices, if any were started."""
+        if self._pool is not None:
+            try:
+                self._pool.close()
+            except Exception:
+                pass
+            self._pool = None
 
     def set_fixed(self, fixed_dofs):
         """fixed_dofs: original global DOF indices to constrain."""
@@ -240,9 +221,13 @@ class VoxelFEA:
         return np.asarray(Evec_full, dtype=float)[self.active_elems]
 
     def _apply_K(self, u, Evec_a):
-        # BLAS matmul (KE is symmetric) then a bincount scatter-add. Both numpy
-        # and cupy provide bincount with the same semantics, so CPU and GPU run
-        # identical, well-tested code (no scatter_add quirks).
+        # BLAS matmul (KE is symmetric) then a bincount scatter-add. The numpy
+        # and GPU array modules share these semantics, so one path runs on both.
+        # When a multi-CPU/multi-GPU pool is active this whole gather-matmul-
+        # scatter is delegated to it instead (see core/parallel_cpu(_gpu).py).
+        if self._pool is not None:
+            return backend.asnumpy(self.xp.asarray(
+                self._pool.apply(backend.asnumpy(u))))
         xp = self.xp
         ue = u[self.edof_x]                                  # (na, 24)
         ke_ue = (ue @ self.KE_x.T) * Evec_a[:, None]
@@ -251,10 +236,13 @@ class VoxelFEA:
 
     def _diagonal(self, Evec_a):
         xp = self.xp
-        diagKE = xp.diag(self.KE_x)
-        contrib = Evec_a[:, None] * diagKE[None, :]          # (na, 24)
-        d = xp.bincount(self.edof_x.ravel(),
-                        weights=contrib.ravel(), minlength=self.ndof)
+        if self._pool is not None:
+            d = self.xp.asarray(self._pool.diagonal())
+        else:
+            diagKE = xp.diag(self.KE_x)
+            contrib = Evec_a[:, None] * diagKE[None, :]          # (na, 24)
+            d = xp.bincount(self.edof_x.ravel(),
+                            weights=contrib.ravel(), minlength=self.ndof)
         d = xp.where(d == 0, 1.0, d)
         return d
 
@@ -269,6 +257,8 @@ class VoxelFEA:
         xp = self.xp
         free = xp.asarray(self.free)
         Evec_a = xp.asarray(self._Evec_active(Evec))
+        if self._pool is not None:
+            self._pool.set_density(backend.asnumpy(Evec_a))
         f_r = xp.asarray(np.asarray(f, dtype=float)[self.used_dofs])
 
         self._diag = self._diagonal(Evec_a)
@@ -289,8 +279,7 @@ class VoxelFEA:
 
         fnorm = float(xp.linalg.norm(xp.where(free, f_r, 0.0)))
         if fnorm == 0:
-            u_full = np.zeros(self.ndof_full)
-            return u_full
+            return np.zeros(self.ndof_full)
         max_cg = max_cg or 4 * int(self.free.sum())
 
         for _ in range(max_cg):
@@ -308,9 +297,8 @@ class VoxelFEA:
             rz = rz_new
 
         u = xp.where(free, u, 0.0)
-        u_r = u if not self.gpu else xp.asnumpy(u)
         u_full = np.zeros(self.ndof_full)
-        u_full[self.used_dofs] = u_r
+        u_full[self.used_dofs] = backend.asnumpy(u)
         return u_full
 
     def element_strain_energy(self, u_full):
