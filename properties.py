@@ -109,17 +109,64 @@ class TO_Settings(PropertyGroup):
                     "allowed before moving on. Lower = run longer/more refined; "
                     "higher = finish sooner",
     )
-    use_gpu: BoolProperty(
-        name="Use GPU if available", default=True,
-        description="Run the solver on the graphics card via CuPy when it is "
-                    "installed and a CUDA GPU is present; otherwise uses the "
-                    "CPU automatically. See the GPU line below for status",
-    )
     use_multigrid: BoolProperty(
         name="Multigrid solver", default=True,
         description="Use a geometric-multigrid preconditioner for the FEA "
                     "solve. Much faster on fine grids; falls back to the plain "
                     "solver automatically if it cannot be built",
+    )
+    show_compute_advanced: BoolProperty(
+        name="", default=False,
+        description="Show compute backend detail (thread count, device "
+                    "status). Auto-opens when you pick a non-Auto Compute "
+                    "mode and auto-folds back in when you return to Auto -- "
+                    "click the arrow any time to override",
+    )
+    compute_mode: EnumProperty(
+        name="Compute", default='AUTO',
+        update=lambda self, context: setattr(
+            self, "show_compute_advanced", self.compute_mode != 'AUTO'),
+        items=[('AUTO', "Auto (recommended)",
+                "Pick CPU / GPU / multi-GPU / multi-CPU automatically from the "
+                "problem size each level: small grids stay on the CPU (a GPU "
+                "would be slower once you count transfer overhead), larger "
+                "grids move to the GPU (GPU edition only), and very large "
+                "grids split the work across every visible GPU -- or, with no "
+                "GPU, across CPU worker processes"),
+               ('CPU', "CPU (single process)",
+                "Always numpy on one process, using the BLAS thread pool "
+                "(see CPU Threads below). No GPU, no extra processes"),
+               ('GPU', "GPU (single device)",
+                "Always the graphics card via Cu-Py (GPU edition only); falls "
+                "back to CPU automatically if Cu-Py/CUDA is not usable"),
+               ('MULTI_GPU', "Multi-GPU",
+                "Split the FEA matvec across every visible CUDA device (GPU "
+                "edition only, needs 2+ GPUs); falls back one rung at a time "
+                "if that is not possible"),
+               ('MULTI_CPU', "Multi-CPU (experimental)",
+                "Split the FEA matvec across CPU worker processes instead of "
+                "one process. Only pays for itself on large grids -- the "
+                "per-iteration hand-off has its own cost; Auto only reaches "
+                "for this at large problem sizes")],
+        description="Which compute backend the solver uses. Auto is right for "
+                    "almost everyone; the other options force a specific "
+                    "backend for testing/benchmarking on your own machine",
+    )
+    cpu_threads: IntProperty(
+        name="CPU Threads", default=0, min=0, soft_max=64,
+        description="BLAS/worker-process thread count. 0 = automatic (all "
+                    "logical cores minus one, so the UI thread is never "
+                    "starved). Only raise this if you specifically want "
+                    "fewer cores used (e.g. to keep the machine responsive "
+                    "for other work while optimizing)",
+    )
+    verbose_log: BoolProperty(
+        name="Verbose solver log", default=True,
+        description="Print the chosen compute backend (CPU/GPU/multi-GPU/"
+                    "multi-CPU), device/worker counts and BLAS thread count "
+                    "to the console (Window > Toggle System Console) at the "
+                    "start of each level. Useful to confirm what your machine "
+                    "actually used and to compare timings",
     )
 
     # --- Optimization targets ---
@@ -211,6 +258,13 @@ def register():
 
 
 def unregister():
-    del bpy.types.Scene.blendtopo
+    # Guard both steps: register() may have aborted before reaching the
+    # PointerProperty assignment, or before registering some classes --
+    # Blender still calls unregister() on every module as cleanup in that
+    # case, which would otherwise raise AttributeError / "missing bl_rna
+    # attribute ... may not be registered".
+    if hasattr(bpy.types.Scene, "blendtopo"):
+        del bpy.types.Scene.blendtopo
     for cls in reversed(_CLASSES):
-        bpy.utils.unregister_class(cls)
+        if hasattr(cls, "bl_rna"):
+            bpy.utils.unregister_class(cls)
