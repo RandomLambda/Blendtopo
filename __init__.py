@@ -7,17 +7,6 @@ in a coarse-to-fine schedule, and rebuild a mesh after every step so the user
 can stop at any time and keep the latest result.
 """
 
-bl_info = {
-    "name": "Blendtopo - Topology Optimization",
-    "author": "Philip + Claude",
-    "version": (0, 8, 1),
-    "blender": (4, 2, 0),
-    "location": "View3D > Sidebar (N) > Blendtopo",
-    "description": "Topology optimization on solid mesh parts with build space, "
-                   "exclusions, bearings and loads. Coarse-to-fine remeshing.",
-    "category": "Mesh",
-}
-
 from . import properties
 from . import operators
 from . import ui
