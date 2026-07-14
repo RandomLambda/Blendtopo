@@ -24,6 +24,8 @@ The Blendtopo panel and a result forming inside the build space
 -->
 
 ## Install (Blender 4.2+)
+The add-on has been approved. So, if you do not want to install the GPU version, you can find the add-on here:
+[https://extensions.blender.org/approval-queue/blendtopo/](https://extensions.blender.org/add-ons/blendtopo/)
 
 Drag the `blendtopo-*.zip` into the Blender window and confirm — it installs as
 an extension. (Or Edit ▸ Preferences ▸ Add-ons ▸ Install from Disk.) Then open
