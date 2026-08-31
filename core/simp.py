@@ -17,6 +17,20 @@ import numpy as np
 from .fea import VoxelFEA
 from .multigrid import MGSolver
 
+# Light neighbourhood-averaging radius (voxels) applied to the von Mises
+# stress heatmap before it's shown. Two things make raw per-element stress
+# look noisy/banded even when the shape itself is clean: (1) the SIMP loop's
+# CG tolerance is tuned for compliance (a global, solve-noise-tolerant energy
+# functional), not for stress (a local, differentiated quantity that picks up
+# the same tiny residual noise and turns it into visible ripples), and (2) the
+# stress lives on the coarse FEA voxel grid but gets interpolated onto a much
+# finer surface mesh, which aliases a bit wherever the surface runs near-
+# tangent to the voxel lattice. Smoothing the field fixes the visual symptom
+# cheaply either way. Deliberately independent of the density Filter Radius
+# setting (rmin) - that one tunes minimum structural feature size, a different
+# concern from "does the heatmap look smooth".
+_STRESS_SMOOTH_RMIN = 1.5
+
 
 def resample_density(old_rho3d, old_origin, old_vsize, new_centers):
     """Trilinearly sample a coarse density field at new voxel centers.
@@ -110,6 +124,33 @@ def _apply_filter(field3d, offsets):
     return out / wsum
 
 
+def _apply_filter_masked(field3d, offsets, mask3d):
+    """Weighted neighbourhood average like _apply_filter, but neighbours
+    outside ``mask3d`` are excluded from both the sum *and* the weight total
+    (rather than treated as zero-valued). Used to smooth the stress heatmap:
+    a plain zero-padded average would pull every element right at the
+    material/void boundary toward zero, which is exactly where the visible
+    surface (and therefore the color you actually see) sits. Cells outside
+    the mask are returned as 0.
+    """
+    m = mask3d.astype(float)
+    masked_field = field3d * m
+    num = np.zeros_like(field3d)
+    den = np.zeros_like(field3d)
+    nx, ny, nz = field3d.shape
+    for dx, dy, dz, w in offsets:
+        sx0, sx1 = max(0, -dx), nx - max(0, dx)
+        sy0, sy1 = max(0, -dy), ny - max(0, dy)
+        sz0, sz1 = max(0, -dz), nz - max(0, dz)
+        dx0, dx1 = max(0, dx), nx - max(0, -dx)
+        dy0, dy1 = max(0, dy), ny - max(0, -dy)
+        dz0, dz1 = max(0, dz), nz - max(0, -dz)
+        num[dx0:dx1, dy0:dy1, dz0:dz1] += w * masked_field[sx0:sx1, sy0:sy1, sz0:sz1]
+        den[dx0:dx1, dy0:dy1, dz0:dz1] += w * m[sx0:sx1, sy0:sy1, sz0:sz1]
+    den[den == 0] = 1.0
+    return np.where(mask3d, num / den, 0.0)
+
+
 class Problem:
     """Container for a discretized optimization problem."""
 
@@ -124,6 +165,7 @@ class Problem:
         self.penalty = penalty
         self.e0 = e0
         self.e_min = e_min
+        self.nelem = nx * ny * nz
 
         self.fea = VoxelFEA(nx, ny, nz, nu=nu, e_min=e_min,
                             active_elems=self.active, compute_mode=compute_mode,
@@ -141,10 +183,29 @@ class Problem:
                 self.mg = MGSolver(nx, ny, nz, fixed_dofs, nu=nu,
                                    compute_mode=compute_mode,
                                    cpu_threads=cpu_threads, verbose=verbose)
-            except Exception:
+            except Exception as exc:
+                # NOT a routine "no GPU present" downgrade (MGSolver/_init_pool
+                # already handle that gracefully and quietly one rung at a
+                # time) -- reaching here means MGSolver's __init__ itself
+                # raised, which used to be swallowed completely silently.
+                # That silence previously hid a real benchmarking gap: some
+                # problem sizes were quietly running WITHOUT multigrid at all
+                # (falling back to fea.VoxelFEA's plain Jacobi-PCG), with no
+                # sign of it other than a missing MG timing breakdown in
+                # paper/experiments/benchmark_multigpu.py's output. Always
+                # print (not gated on `verbose`) since an unexpected
+                # multigrid failure is exactly the kind of thing a silent
+                # fallback should never hide.
+                import traceback
+                print(f"[Blendtopo] MGSolver construction failed for "
+                      f"{nx}x{ny}x{nz} (mode={compute_mode}): {exc}\n"
+                      f"{traceback.format_exc()}"
+                      f"[Blendtopo] Falling back to fea.VoxelFEA (no "
+                      f"multigrid preconditioning) for this problem.")
                 self.mg = None
 
         self._offsets = _build_filter(nx, ny, nz, rmin)
+        self._stress_offsets = _build_filter(nx, ny, nz, _STRESS_SMOOTH_RMIN)
         self.last_u = None
 
     def close(self):
@@ -197,7 +258,19 @@ class Problem:
             if self.mg is not None:
                 try:
                     u = self.mg.solve(Evec, self.force, x0=u_prev, tol=cg_tol)
-                except Exception:
+                except Exception as exc:
+                    # See the matching comment in __init__ -- this used to be
+                    # silent too, which is worse here: it can strike mid-run
+                    # (e.g. iteration 7 of 20), permanently disabling
+                    # multigrid for the REST of this Problem without any
+                    # trace, right when the density field is furthest from
+                    # the initial state that construction-time testing saw.
+                    import traceback
+                    print(f"[Blendtopo] MGSolver.solve() failed at SIMP "
+                          f"iter (mode may vary) for {self.nx}x{self.ny}x"
+                          f"{self.nz}: {exc}\n{traceback.format_exc()}"
+                          f"[Blendtopo] Disabling multigrid for the rest of "
+                          f"this run; falling back to fea.VoxelFEA.")
                     self.mg = None
                     u = self.fea.solve(Evec, self.force, x0=u_prev, tol=cg_tol)
             else:
@@ -222,6 +295,32 @@ class Problem:
 
             if change < tol:
                 break
+
+    def element_von_mises(self, rho, u=None, smooth=True):
+        """Per-element von Mises stress (length nx*ny*nz) for the given
+        density field and displacement (defaults to the last solved ``u``).
+        Zero outside the active region and zero if no solve has happened yet.
+
+        smooth : apply a light neighbourhood average (see
+        _STRESS_SMOOTH_RMIN) so CG solver noise and voxel/surface-mesh
+        aliasing don't show up as ripples in a stress heatmap. Leaves the
+        raw active-region zeros alone (empty space stays exactly zero, so
+        the smoothing only blurs stress *within* solid material, never
+        bleeds "phantom" stress into the surrounding void).
+        """
+        if u is None:
+            u = self.last_u
+        if u is None:
+            return np.zeros(self.nelem)
+        Evec = self.e_min + np.asarray(rho, dtype=float) ** self.penalty * (
+            self.e0 - self.e_min)
+        vm = self.fea.element_von_mises_stress(u, Evec)
+        if smooth:
+            active3d = self.active.reshape(self.shape)
+            vm3d = _apply_filter_masked(vm.reshape(self.shape),
+                                        self._stress_offsets, active3d)
+            vm = vm3d.ravel()
+        return vm
 
     def _oc_update(self, rho, dc, active, n_active, move=0.2):
         """Optimality-criteria density update with bisection on the multiplier."""

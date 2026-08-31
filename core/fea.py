@@ -76,6 +76,52 @@ def _hex8_KE(E=1.0, nu=0.3):
     return KE
 
 
+def _hex8_B_C(nu=0.3):
+    """B (strain-displacement, 6x24) evaluated at the cell centroid, plus the
+    unit-E material matrix C (6x6). Row/col order is [xx, yy, zz, xy, yz, zx],
+    matching ``_hex8_KE``. A single centroid sample (rather than 8 Gauss
+    points) gives one representative stress per element, which is standard
+    hex8 stress recovery and all a per-voxel heatmap needs.
+    """
+    nodes = np.array([
+        [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+        [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+    ], dtype=float)
+
+    c = 1.0 / ((1 + nu) * (1 - 2 * nu))
+    C = c * np.array([
+        [1 - nu, nu, nu, 0, 0, 0],
+        [nu, 1 - nu, nu, 0, 0, 0],
+        [nu, nu, 1 - nu, 0, 0, 0],
+        [0, 0, 0, (1 - 2 * nu) / 2, 0, 0],
+        [0, 0, 0, 0, (1 - 2 * nu) / 2, 0],
+        [0, 0, 0, 0, 0, (1 - 2 * nu) / 2],
+    ])
+
+    xi = eta = zeta = 0.0
+    dN = np.zeros((3, 8))
+    for i, (a, b, c_) in enumerate(nodes):
+        dN[0, i] = a * (1 + b * eta) * (1 + c_ * zeta) / 8.0
+        dN[1, i] = b * (1 + a * xi) * (1 + c_ * zeta) / 8.0
+        dN[2, i] = c_ * (1 + a * xi) * (1 + b * eta) / 8.0
+    J = np.array([[0.5, 0, 0], [0, 0.5, 0], [0, 0, 0.5]])
+    dNxyz = np.linalg.solve(J, dN)
+    B = np.zeros((6, 24))
+    for i in range(8):
+        bx, by, bz = dNxyz[:, i]
+        c0 = 3 * i
+        B[0, c0] = bx
+        B[1, c0 + 1] = by
+        B[2, c0 + 2] = bz
+        B[3, c0] = by
+        B[3, c0 + 1] = bx
+        B[4, c0 + 1] = bz
+        B[4, c0 + 2] = by
+        B[5, c0] = bz
+        B[5, c0 + 2] = bx
+    return B, C
+
+
 # ---------------------------------------------------------------------------
 # Element <-> global DOF connectivity
 # ---------------------------------------------------------------------------
@@ -123,6 +169,7 @@ class VoxelFEA:
         self.ndof_full = 3 * (nx + 1) * (ny + 1) * (nz + 1)
         self.e_min = e_min
         self.KE = _hex8_KE(E=1.0, nu=nu)
+        self._B0, self._C0 = _hex8_B_C(nu=nu)           # centroid stress recovery
         self.edof_full = build_edof(nx, ny, nz)        # full, original DOFs
 
         if active_elems is None:
@@ -143,10 +190,14 @@ class VoxelFEA:
         self.free = None
         self._diag = None
         self.verbose = verbose
+        self.last_iters = 0
+        self.last_converged = None
+        self.last_resid_ratio = float("nan")
 
-        # Decide CPU / single-GPU / multi-GPU / multi-process-CPU for this
-        # grid's actual (reduced) DOF count -- see core/compute_plan.py for
-        # the thresholds. When the plan is "parallel" (multi_gpu/multi_cpu),
+        # Decide CPU / single-GPU / multi-GPU for this grid's actual
+        # (reduced) DOF count -- see core/compute_plan.py for the thresholds
+        # (multi_cpu was removed outright, not just de-prioritized -- see
+        # that module's docstring). When the plan is "parallel" (multi_gpu),
         # the hot gather-matmul-scatter in _apply_K/_diagonal is delegated to
         # a pool and the surrounding CG vector ops stay on host numpy (they
         # are O(ndof), cheap, and the pool already hands back host arrays).
@@ -167,27 +218,16 @@ class VoxelFEA:
 
     def _init_pool(self):
         """Build the multi-worker matvec pool if the plan calls for one,
-        falling back one rung (multi_gpu -> gpu -> cpu, multi_cpu -> cpu) if
-        it fails to construct for any reason -- a failed accelerator must
-        never abort the solve, only make it slower."""
+        falling back one rung (multi_gpu -> gpu -> cpu) if it fails to
+        construct for any reason -- a failed accelerator must never abort
+        the solve, only make it slower. (multi_cpu was removed outright --
+        compute_plan.choose() never produces plan.kind == "multi_cpu" any
+        more, see that module's docstring -- so there is no branch for it
+        here.)"""
         plan = self.plan
-        if plan.kind == "multi_cpu":
-            from . import parallel_cpu
+        if plan.kind == "multi_gpu":
             try:
-                self._pool = parallel_cpu.CPUMatVecPool(
-                    self.edof, self.KE, self.ndof, plan.n_workers,
-                    verbose=self.verbose)
-                return
-            except Exception as exc:
-                if self.verbose:
-                    print(f"[Blendtopo] multi-CPU pool unavailable ({exc}); "
-                          f"falling back to single-process CPU")
-                self.plan = compute_plan.ComputePlan(
-                    "cpu", np, 1, "CPU (multi-CPU fallback)")
-                self.xp = np
-        elif plan.kind == "multi_gpu":
-            from . import parallel_gpu
-            try:
+                from . import parallel_gpu
                 self._pool = parallel_gpu.GPUMatVecPool(
                     self.edof, self.KE, self.ndof, plan.n_workers,
                     verbose=self.verbose)
@@ -223,8 +263,8 @@ class VoxelFEA:
     def _apply_K(self, u, Evec_a):
         # BLAS matmul (KE is symmetric) then a bincount scatter-add. The numpy
         # and GPU array modules share these semantics, so one path runs on both.
-        # When a multi-CPU/multi-GPU pool is active this whole gather-matmul-
-        # scatter is delegated to it instead (see core/parallel_cpu(_gpu).py).
+        # When a multi-GPU pool is active this whole gather-matmul-scatter is
+        # delegated to it instead (see core/parallel_gpu.py).
         if self._pool is not None:
             return backend.asnumpy(self.xp.asarray(
                 self._pool.apply(backend.asnumpy(u))))
@@ -251,6 +291,14 @@ class VoxelFEA:
 
         x0 : optional warm-start (full-length numpy) - hugely cuts CG iters
         because the structure changes only slightly between SIMP steps.
+
+        Convergence guards/diagnostics mirror multigrid.MGSolver.solve()
+        exactly (last_iters/last_converged/last_resid_ratio, zero-denominator
+        guards, an unconditional non-convergence warning): this path used to
+        have none of that, so silently under-converging here - which feeds
+        directly into every downstream compliance/sensitivity/stress number -
+        was invisible. It's a correctness signal, not a progress log line, so
+        the warning prints regardless of the verbose setting, same as MG's.
         """
         if self.free is None:
             raise RuntimeError("call set_fixed() before solve()")
@@ -263,6 +311,10 @@ class VoxelFEA:
 
         self._diag = self._diagonal(Evec_a)
         Minv = 1.0 / self._diag
+
+        self.last_iters = 0
+        self.last_converged = False
+        self.last_resid_ratio = float("nan")
 
         if x0 is None:
             u = xp.zeros(self.ndof)
@@ -279,22 +331,48 @@ class VoxelFEA:
 
         fnorm = float(xp.linalg.norm(xp.where(free, f_r, 0.0)))
         if fnorm == 0:
+            self.last_converged = True
             return np.zeros(self.ndof_full)
         max_cg = max_cg or 4 * int(self.free.sum())
 
-        for _ in range(max_cg):
+        for it in range(max_cg):
             Kp = self._apply_K(p, Evec_a)
             Kp = xp.where(free, Kp, 0.0)
-            alpha = rz / float(p @ Kp)
+            pKp = float(p @ Kp)
+            if pKp == 0.0:
+                # Vanishing denominator on a well-posed SPD system: nothing
+                # left to improve along p - (numerical) convergence, not an
+                # error. Same reasoning/guard as MGSolver.solve().
+                self.last_converged = (self.last_resid_ratio < tol)
+                break
+            alpha = rz / pKp
             u = u + alpha * p
             r = r - alpha * Kp
-            if float(xp.linalg.norm(xp.where(free, r, 0.0))) / fnorm < tol:
+            self.last_iters = it + 1
+            self.last_resid_ratio = (
+                float(xp.linalg.norm(xp.where(free, r, 0.0))) / fnorm)
+            if self.last_resid_ratio < tol:
+                self.last_converged = True
                 break
             z = xp.where(free, Minv * r, 0.0)
             rz_new = float(r @ z)
-            p = z + (rz_new / rz) * p
+            if rz == 0.0:
+                # Same reasoning: the preconditioner has nothing left to
+                # contribute - restart the search direction instead of
+                # dividing by zero (a valid PCG restart).
+                p = z.copy()
+            else:
+                p = z + (rz_new / rz) * p
             p = xp.where(free, p, 0.0)
             rz = rz_new
+
+        if not self.last_converged:
+            print(f"[Blendtopo] WARNING: CG did not converge in {max_cg} "
+                  f"iterations (tol={tol:g}, final residual ratio="
+                  f"{self.last_resid_ratio:.3e}). Returned displacement may "
+                  f"be inaccurate - if this keeps appearing, it explains "
+                  f"visible stress/shape artefacts; if it never appears, "
+                  f"under-convergence can be ruled out as the cause.")
 
         u = xp.where(free, u, 0.0)
         u_full = np.zeros(self.ndof_full)
@@ -309,3 +387,28 @@ class VoxelFEA:
         ke_ue = ue @ self.KE.T
         ce[self.active_elems] = np.einsum('ei,ei->e', ue, ke_ue)
         return ce
+
+    def element_von_mises_stress(self, u_full, Evec):
+        """Per-element von Mises stress for ALL elements (numpy, length nelem).
+
+        Single-point (centroid) stress recovery, scaled by each element's
+        actual (density-penalized) Young's modulus. Zero outside the active
+        region. Cheap - same cost class as element_strain_energy - so it is
+        fine to call every SIMP iteration, not just on the final pass.
+        """
+        u = np.asarray(u_full)
+        vm = np.zeros(self.nelem)
+        if not np.any(self.active_elems):
+            return vm
+        ue = u[self.edof_full[self.active_elems]]            # (na, 24)
+        strain = ue @ self._B0.T                              # (na, 6)
+        stress0 = strain @ self._C0.T                         # (na, 6), E=1
+        Evec_a = np.asarray(Evec, dtype=float)[self.active_elems]
+        stress = stress0 * Evec_a[:, None]
+        sx, sy, sz = stress[:, 0], stress[:, 1], stress[:, 2]
+        txy, tyz, tzx = stress[:, 3], stress[:, 4], stress[:, 5]
+        vm_a = np.sqrt(np.maximum(
+            0.5 * ((sx - sy) ** 2 + (sy - sz) ** 2 + (sz - sx) ** 2)
+            + 3.0 * (txy ** 2 + tyz ** 2 + tzx ** 2), 0.0))
+        vm[self.active_elems] = vm_a
+        return vm

@@ -16,23 +16,15 @@ Two backends:
   even on a platform for which we didn't bundle a matching wheel. Its temp
   arrays are chunked over *both* points and triangles (see ``_POINT_CHUNK``
   below) to keep memory bounded on heavy meshes.
-* ``_inside_mask_trimesh`` - uses ``trimesh`` + ``rtree`` for the broad-phase.
-  Both are bundled as wheels under ``./wheels/`` and declared in
-  ``blender_manifest.toml`` (see the Extensions Platform's "Be Self
-  Contained" / "Bundle Modules" rules: a feature must not depend on a
-  library the extension doesn't ship itself). Benchmarked against the numpy
-  path in a controlled, paired, repeated-measures experiment (105 trials,
-  icosphere test meshes 20-81920 triangles; see ``paper/experiments/`` for
-  the full script, raw data, and figure): trimesh loses clearly below a few
-  hundred triangles (its ~0.1-0.2s fixed overhead from building the Trimesh
-  + rtree index dominates), is roughly break-even around 320 triangles, and
-  wins with high statistical significance (paired t-test p < 0.02, p < 1e-4
-  above ~5000 triangles) from ~1280 triangles up -- interpolated crossover
-  ~551 triangles. The numpy path also becomes impractically slow (seconds
-  to tens of seconds, or the memory blow-up described above) well before
-  that. Kept as a separate function (rather than always-on) purely so the
-  tiny/degenerate-mesh case still gets the faster numpy path, and so we
-  have *some* fallback if a platform has no matching wheel.
+* ``_inside_mask_trimesh`` - uses ``trimesh`` + ``rtree`` for the broad-phase,
+  both bundled as wheels (self-contained, per the Extensions Platform's
+  bundling rules). Benchmarked against the numpy path (paired, repeated
+  measures, icosphere test meshes; see ``paper/experiments/``): trimesh
+  loses below a few hundred triangles (fixed index-build overhead
+  dominates), roughly breaks even around 320, and wins clearly from ~1280
+  triangles up. Kept as a separate function so tiny/degenerate meshes still
+  get the faster numpy path, and as a fallback if a platform has no
+  matching wheel.
 
 It is also runnable as a standalone script (this is how the subprocess is
 launched)::

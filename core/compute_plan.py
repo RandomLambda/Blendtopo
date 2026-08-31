@@ -16,63 +16,33 @@ Thresholds:
                                      that passed its self-test, else CPU.
   ndof >= MULTI_GPU_DOF           -> split the matrix-free matvec across every
                                      visible GPU (GPU edition, >1 device),
-                                     else across CPU worker processes if that
-                                     is available and beneficial at this size,
-                                     else falls back one rung at a time down
-                                     to plain CPU.
+                                     else falls back to single GPU, then CPU.
 
-GPU_DOF (single-GPU-vs-CPU) is a threshold, not a measurement -- it has not
-been benchmarked, only reasoned about (kernel-launch/transfer overhead
-dominates small problems). MULTI_GPU_DOF/MULTI_CPU_DOF specifically WERE
-benchmarked, on real hardware (2x GTX 970, paper/experiments/
-benchmark_multigpu.py), across two rounds so far:
+GPU_DOF was benchmarked (paper/experiments/pipeline_timing_results_v2.csv):
+CPU wins below ~91,875 DOF, GPU wins above; the crossover is set to 50,000,
+known only to within that gap.
 
-Round 1: multi-GPU came back 1.5x-3.5x SLOWER than single-GPU at every size
-from 91,875 DOF up to the largest tested (1,635,075 DOF), i.e. throughout
-and beyond this threshold. Root cause: core/multigrid.py's V-cycle was
-routing its smoothing passes through the pool too, not just the outer CG
-loop's own matvec -- roughly 5 pooled calls per outer CG iteration instead
-of ~2, each paying a full host round-trip on every device for work too
-small to amortize that cost. Fixed by splitting MGSolver._apply (local,
-smoothing-only) from _apply_pooled (outer CG only).
+MULTI_GPU_DOF is set far above any benchmarked size: pooling the outer CG
+matvec across 2 GPUs was measured at best a noise-level parity and at worst
+a real loss at larger sizes, because only that one matvec is pooled per
+iteration while V-cycle smoothing stays single-device -- the pooling
+overhead is roughly fixed per call but doesn't shrink as the problem grows.
+compute_mode="MULTI_GPU" still works as an explicit, forced choice. See
+paper/experiments/MULTIPROCESSING_FINDINGS.md and multigrid.py's module
+docstring for the measurements behind this.
 
-Round 2 (after the above fix + streams/pinned-memory in
-parallel_gpu_domain.py): small problems improved a lot (~8x FASTER than
-single-GPU at 1,911 DOF), but large problems got WORSE (~6.5x slower at
-1,101,411 DOF, with measured GPU utilization *dropping* below 30%). Tried
-fix (Round 3, since reverted): hypothesized that _apply's now-un-pooled
-smoothing, still running on single-threaded host numpy, had become the
-bottleneck, so MGSolver was changed to use Cu-Py instead of numpy for that
-local work. Measured on the same hardware this made things WORSE AGAIN
-(45.6s vs Round 2's 19.6s) -- disproving the hypothesis (Cu-Py's bincount,
-a scatter-add over colliding FEA node indices, apparently doesn't
-parallelize well via atomics on this hardware, and forcing Cu-Py also added
-extra full-vector D2H/H2D copies around _apply_pooled that Round 2 didn't
-pay). Reverted back to Round 2's numpy rule. See "multi_gpu xp history" in
-core/multigrid.py's module docstring for the full blow-by-blow.
+Below GPU_DOF, a GPU is not used even if present: kernel-launch / transfer
+overhead dominates at that scale, so CPU numpy is faster for the small
+grids typical of the coarse SIMP levels.
 
-Round 2's 19.6x-slower number is therefore still the current best-known
-state for large multi-GPU problems, and its root cause is NOT yet
-identified -- two guesses in a row have been wrong. MGSolver.solve() now
-prints a wall-clock breakdown (pooled vs. local V-cycle time) when
-"Verbose solver log" is enabled; read that output before changing this
-again rather than reasoning from aggregate timing alone. Until a Round 4
-fix is verified, treat MULTI_GPU_DOF as unverified for large problems -- if
-you re-run benchmark_multigpu.py and multi-GPU is still a net loss at your
-sizes, raise this threshold (or drop multi-GPU from AUTO entirely and keep
-it as an explicit compute_mode="MULTI_GPU" opt-in only).
-
-Below GPU_DOF, a GPU is *not* used even if present and requested: kernel-
-launch / host<->device transfer overhead dominates the actual compute at that
-scale, so numpy on the CPU is faster in practice for the small grids typical
-of the coarse SIMP levels. This module exists so that decision is made in one
-place instead of being re-litigated at every call site.
-
-MULTI_CPU uses the same DOF threshold as MULTI_GPU: multi-process CPU work
-only pays for itself once there is enough element work per worker to amortize
-the shared-memory hand-off/IPC cost every CG iteration; below that scale a
-single process (with the BLAS thread pool sized to the machine) is both
-simpler and faster.
+multi_cpu is not de-prioritized, it is unreachable: the pooled outer-CG
+matvec is only ~10% of MGSolver's per-iteration cost, so Amdahl's law caps
+the best possible speedup at ~1.11x regardless of core count, while adding
+a 2.5-3s pool-spawn cost paid every time Problem()/MGSolver is rebuilt --
+untenable for this addon's "remesh often, refine successively" design. As
+of v1.1.19 there is no AUTO threshold or forced compute_mode="MULTI_CPU"
+path; choose() maps it to CPU. See
+paper/experiments/MULTIPROCESSING_FINDINGS.md for the measurements.
 """
 
 import os
@@ -80,8 +50,21 @@ import os
 from . import backend
 
 GPU_DOF = 50_000
-MULTI_GPU_DOF = 500_000
-MULTI_CPU_DOF = 500_000
+# Set far above the tested range so AUTO never picks multi_gpu until a real
+# measured win justifies lowering this. compute_mode="MULTI_GPU" remains
+# available as an explicit, forced choice regardless of this threshold (see
+# multigrid.py's _init_pool).
+MULTI_GPU_DOF = 50_000_000
+# No MULTI_CPU_DOF / AUTO branch / forced compute_mode="MULTI_CPU" path
+# exists any more -- the Amdahl ceiling makes multi_cpu a loss-or-noise
+# result at every size tested. choose() maps mode="MULTI_CPU" to CPU below.
+
+# Threshold for MGSolver to route V-cycle smoothing (not just the outer CG
+# matvec) through a CPU pool too -- see MULTIPROCESSING_FINDINGS.md Section
+# 5. Conservative: real-hardware measurement found a loss below ~700k DOF
+# and a win above ~1.1M DOF at the default sweep count; this sits in the
+# untested gap, closer to the confirmed win.
+POOLED_SMOOTH_CPU_DOF = 1_000_000
 
 _THREADPOOL_LIMITER = None   # kept alive for the process lifetime
 
@@ -92,16 +75,17 @@ class ComputePlan:
     __slots__ = ("kind", "xp", "n_workers", "label")
 
     def __init__(self, kind, xp, n_workers, label):
-        self.kind = kind            # 'cpu' | 'gpu' | 'multi_gpu' | 'multi_cpu'
+        self.kind = kind            # 'cpu' | 'gpu' | 'multi_gpu'
+                                    # ('multi_cpu' is no longer produced by
+                                    # choose() -- see module docstring)
         self.xp = xp                # array module to use for the (single-
                                     # device) parts of the computation
-        self.n_workers = n_workers  # devices (multi_gpu) or processes
-                                    # (multi_cpu); 1 otherwise
+        self.n_workers = n_workers  # devices (multi_gpu); 1 otherwise
         self.label = label          # human-readable, for the debug log
 
     @property
     def parallel(self):
-        return self.kind in ("multi_gpu", "multi_cpu")
+        return self.kind == "multi_gpu"
 
 
 def cpu_worker_count(requested=0):
@@ -156,12 +140,13 @@ def choose(ndof, mode="AUTO", cpu_threads=0, verbose=False):
     """Resolve a ComputePlan for a problem with ``ndof`` (reduced) DOFs.
 
     mode: 'AUTO' (thresholds above), or a forced 'CPU' / 'GPU' / 'MULTI_GPU'
-    / 'MULTI_CPU' (falls back gracefully -- towards CPU -- if the forced mode
-    is not actually available, it is never allowed to silently do nothing).
+    (falls back gracefully -- towards CPU -- if the forced mode is not
+    actually available, it is never allowed to silently do nothing).
+    'MULTI_CPU' is accepted for backward compatibility but always maps to
+    CPU -- see module docstring for why multi_cpu was removed outright.
     """
     mode = (mode or "AUTO").upper()
     n_workers_cpu = cpu_worker_count(cpu_threads)
-    configure_cpu_threads(n_workers_cpu, verbose=verbose)
 
     gpu_build = backend.is_gpu_build()
     gpu_ok = gpu_build and backend.gpu_usable()
@@ -178,30 +163,30 @@ def choose(ndof, mode="AUTO", cpu_threads=0, verbose=False):
         return ComputePlan("multi_gpu", backend.get_xp(True), n_gpus,
                             f"multi-GPU ({n_gpus} devices, Cu-Py)")
 
-    def _multi_cpu():
-        return ComputePlan("multi_cpu", backend.get_xp(False), n_workers_cpu,
-                            f"multi-process CPU ({n_workers_cpu} workers)")
-
     if mode == "CPU":
         plan = _cpu()
     elif mode == "GPU":
         plan = _gpu() if gpu_ok else _cpu()
     elif mode == "MULTI_GPU":
         plan = _multi_gpu() if (gpu_ok and n_gpus > 1) else (_gpu() if gpu_ok else _cpu())
-    elif mode == "MULTI_CPU":
-        plan = _multi_cpu() if n_workers_cpu > 1 else _cpu()
-    else:  # AUTO
+    else:  # AUTO, and MULTI_CPU (no longer selectable -- see module docstring)
         if ndof >= MULTI_GPU_DOF and gpu_ok and n_gpus > 1:
             plan = _multi_gpu()
-        elif ndof >= MULTI_CPU_DOF and n_workers_cpu > 1 and not gpu_ok:
-            # Only reach for multi-process CPU at large scale, and only when
-            # there is no usable GPU -- a single GPU is very likely faster
-            # than several CPU processes at this size anyway.
-            plan = _multi_cpu()
         elif ndof >= GPU_DOF and gpu_ok:
             plan = _gpu()
         else:
             plan = _cpu()
+
+    # Main-process BLAS thread count is set AFTER the plan is known, not
+    # before: it depends on whether a worker pool is also about to exist.
+    # For "cpu"/"gpu" plans, this process does all the real matvec work
+    # itself, so it gets the full n_workers_cpu BLAS threads. "multi_gpu"
+    # leaves the heavy lifting to the pooled devices, not host BLAS, so it
+    # is capped to 1 thread here to avoid oversubscribing the same cores
+    # its own O(ndof) leftover work still touches.
+    main_process_threads = (1 if plan.kind == "multi_gpu"
+                             else n_workers_cpu)
+    configure_cpu_threads(main_process_threads, verbose=verbose)
 
     if verbose:
         print(f"[Blendtopo] compute plan: ndof={ndof} mode={mode} -> "

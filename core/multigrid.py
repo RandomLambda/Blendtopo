@@ -18,46 +18,15 @@ Jacobi-PCG, identical to fea.solve.
 Works on the full regular grid (void elements carry e_min stiffness). Pure
 numpy, no external dependencies.
 
-multi_gpu xp history (real-hardware benchmark timeline, 2x GTX 970, see
-paper/experiments/benchmark_multigpu.py) -- kept here because the reasoning
-that turned out to be WRONG is exactly the kind of thing worth not
-re-discovering the hard way a third time:
-
-  Round 1: self.xp was numpy for every "parallel" plan (multi_gpu/multi_cpu),
-  copying fea.VoxelFEA's rule, AND the V-cycle smoother was routed through
-  the pool along with the outer CG matvec. Multi-GPU was 1.5x-3.5x SLOWER
-  than single-GPU. Root cause: routing smoothing through the pool (~5 pooled
-  calls/iteration instead of ~2), each paying a full host round-trip per
-  device for work too small to amortize. Fix: split MGSolver._apply (local,
-  never pooled) from _apply_pooled (outer CG only, pooled).
-
-  Round 2 (after the Round 1 fix + streams/pinned-memory in
-  parallel_gpu_domain.py): self.xp still numpy. Small problems got much
-  faster (~8x vs single-GPU), but large problems got WORSE (~6.5x slower,
-  1,101,411 DOF, GPU utilization measured <30%). Hypothesis at the time:
-  the now-un-pooled local smoothing, forced onto single-threaded host numpy,
-  had become the bottleneck -- so self.xp was changed to
-  backend.get_xp(True) (Cu-Py, single device) for multi_gpu, keeping only
-  _apply_pooled's host round-trip to reach the multi-device pool.
-
-  Round 3 (testing the Round 2 hypothesis): multi-GPU got WORSE AGAIN
-  (45.6s vs 19.6s at the same 1.1M-DOF case) -- disproving the hypothesis.
-  Two likely compounding causes: (1) Cu-Py's bincount is a scatter-add with
-  colliding indices (shared FEA nodes between elements), which leans on
-  atomics that apparently do not parallelize well on this hardware -- host
-  numpy's bincount was actually faster per call, not slower; (2) forcing
-  xp=Cu-Py added two extra full-vector D2H/H2D copies per _apply_pooled call
-  (backend.asnumpy(u) / xp.asarray(...) around the pool -- a no-op when xp
-  is already numpy, real transfers when it isn't) that Round 2 did not pay.
-  Reverted self.xp back to numpy for every parallel plan (Round 2's rule).
-
-  Status: Round 2's number (19.6s vs 3.0s single-GPU, ~6.5x slower) is the
-  current best-known state for large multi-GPU problems, and its own root
-  cause is still NOT identified -- "obviously it must be X" has now been
-  wrong twice in a row for this file. MGSolver.solve() gained wall-clock
-  instrumentation (self._t_pooled / self._t_local, printed when verbose)
-  instead of a third guess; run benchmark_multigpu.py with "Verbose solver
-  log" enabled and read the printed breakdown before changing this again.
+Multi-GPU note: the outer CG matvec (_apply_pooled) is dispatched through
+the domain-decomposed pool (see parallel_gpu_domain.py) when one exists;
+V-cycle smoothing at every level always runs single-device (self.xp =
+plan.xp) and is never pooled per-sweep -- pooling smoothing was measured to
+be a net loss (too little compute per call to amortize dispatch/sync
+overhead). DomainGPUMatVecPool.smooth() uses a ghost-element ring so each
+device's local matvec is exact at its boundary nodes; see that class's
+docstring for the derivation. Full history in
+paper/experiments/MULTIPROCESSING_FINDINGS.md.
 """
 
 import time
@@ -110,6 +79,15 @@ def _prolong_op(fine_dims, coarse_dims, xp=np):
 class MGSolver:
     """Multigrid-preconditioned CG on the full voxel grid."""
 
+    # Round 4e/4f/4g: DomainGPUMatVecPool.smooth() (the ghost-ring,
+    # genuinely-parallel level-0 smoother) is mathematically correct but
+    # measured SLOWER than single-device smoothing on real hardware (2x
+    # GTX 970, Windows/WDDM) -- see _smooth's docstring for the full
+    # before/after numbers. Left as a class-level switch (not deleted, not
+    # hidden behind a code comment) so it's easy to find and flip to True
+    # when re-measuring on hardware with lower per-dispatch overhead.
+    _TRY_POOLED_SMOOTH = False
+
     def __init__(self, nx, ny, nz, fixed_dofs, nu=0.3, xp=None,
                  n_smooth=2, omega=0.6, min_elems=4, max_levels=6,
                  compute_mode="AUTO", cpu_threads=0, verbose=False):
@@ -120,18 +98,16 @@ class MGSolver:
         self.omega = omega
         self.verbose = verbose
         self._pool = None
+        # Set in _init_pool once the plan/pool are known -- True only for a
+        # "multi_cpu" plan at/above compute_plan.POOLED_SMOOTH_CPU_DOF (a
+        # SECOND, higher bar than MULTI_CPU_DOF itself). See _smooth's
+        # docstring and MULTIPROCESSING_FINDINGS.md Section 5.
+        self._pool_smooth_enabled = False
 
-        # Wall-clock accounting, reset at the start of every solve() call and
-        # printed at the end when verbose -- added after two rounds of real-
-        # hardware multi-GPU benchmarking produced numbers that contradicted
-        # each other's implied diagnosis (see "multi_gpu xp history" in the
-        # module docstring): guessing which part of the V-cycle is actually
-        # slow from aggregate solve_iter timing alone was not reliable enough
-        # to keep iterating blind. These are plain wall-clock sums (not
-        # profiler-grade -- no exclusion of Python overhead between calls),
-        # but they are enough to tell whether time is going into the pooled
-        # multi-device matvec (_t_pooled) or the un-pooled local V-cycle work
-        # that runs on every level (_t_local, covering _apply/_smooth plus
+        # Wall-clock accounting, reset per solve() call, printed when
+        # verbose: plain wall-clock sums (not profiler-grade) that separate
+        # time in the pooled multi-device matvec (_t_pooled) from the
+        # un-pooled local V-cycle work (_t_local: _apply/_smooth plus
         # _restrict/_prolongate).
         self._t_pooled = 0.0
         self._t_local = 0.0
@@ -143,6 +119,7 @@ class MGSolver:
         # touched every V-cycle smoothing pass -- is ever parallelized;
         # coarser levels are tiny by construction (built by halving until
         # min_elems) so a pool there would be pure overhead.
+        self._requested_mode = (compute_mode or "AUTO").upper()
         if xp is not None:
             # Caller pinned an array module explicitly (e.g. tests): honour
             # it and skip the auto plan/pool entirely.
@@ -152,21 +129,12 @@ class MGSolver:
             self.plan = compute_plan.choose(self.ndof, mode=compute_mode,
                                             cpu_threads=cpu_threads,
                                             verbose=verbose)
-            # REVERTED (see "multi_gpu xp history" below): a prior version of
-            # this file forced self.xp = backend.get_xp(True) (Cu-Py) here,
-            # reasoning that host numpy was the bottleneck for the un-pooled
-            # local V-cycle work. Measured on real hardware that made things
-            # WORSE (45.6s vs 19.6s at 1.1M DOF) -- so that reasoning was
-            # wrong: Cu-Py's bincount (scatter-add with colliding indices,
-            # exactly what FEA assembly is) leans on atomics that don't
-            # parallelize well on this hardware, and forcing xp=Cu-Py also
-            # added two extra full-vector D2H/H2D copies per _apply_pooled
-            # call (backend.asnumpy(u) / xp.asarray(...) around the pool,
-            # which is a no-op when xp is already numpy) that weren't there
-            # before. Back to plain numpy for ALL parallel plans, matching
-            # fea.VoxelFEA -- see "multi_gpu xp history" below for the still-
-            # unexplained 19.6s-vs-3.0s gap this does NOT fix.
-            self.xp = np if self.plan.parallel else self.plan.xp
+            # self.xp is single-device (never pooled) for every plan --
+            # measured ~6.5x faster than numpy for this local work. Only
+            # _apply_pooled (the outer CG matvec) goes through the
+            # multi-device pool; V-cycle smoothing always stays single-device
+            # (see module docstring).
+            self.xp = self.plan.xp
         xp = self.xp
 
         KE = _hex8_KE(E=1.0, nu=nu)
@@ -217,33 +185,27 @@ class MGSolver:
         plan = self.plan
         lv0 = self.levels[0]
         edof0_host = backend.asnumpy(lv0['edof'])
-        if plan.kind == "multi_cpu":
-            from . import parallel_cpu
-            try:
-                self._pool = parallel_cpu.CPUMatVecPool(
-                    edof0_host, self._KE_host, lv0['ndof'], plan.n_workers,
-                    verbose=self.verbose)
-                return
-            except Exception as exc:
-                if self.verbose:
-                    print(f"[Blendtopo] MG: multi-CPU pool unavailable "
-                          f"({exc}); using single-process CPU")
-                self.plan = compute_plan.ComputePlan(
-                    "cpu", np, 1, "CPU (multi-CPU fallback)")
-        elif plan.kind == "multi_gpu":
-            # Domain-decomposed pool first (core/parallel_gpu_domain.py, a
-            # separate opt-in file -- see its module docstring): only every
-            # device's own DOF slice is ever transferred, instead of the
-            # full vector to every device. Only valid for the FULL regular
-            # grid (level 0 always is), so it always applies here. Falls
-            # back to the plain broadcast pool, then single GPU/CPU, exactly
-            # like the multi-CPU branch above -- a broken/unavailable
-            # accelerator must never abort the solve, only make it slower.
+        if plan.kind == "multi_gpu":
+            # Domain-decomposed pool first (core/parallel_gpu_domain.py):
+            # only each device's own DOF slice is transferred, not the full
+            # vector. Only valid for the full regular grid (level 0 always
+            # is). Falls back to the plain broadcast pool, then single
+            # GPU/CPU -- a broken/unavailable accelerator must never abort
+            # the solve, only make it slower.
             from . import parallel_gpu_domain
+            # The min-slab-size guard only protects the ghost-ring
+            # smoother's quality, irrelevant while _TRY_POOLED_SMOOTH is
+            # False (current default). Skipped when the caller explicitly
+            # requested MULTI_GPU rather than AUTO picking it, so an
+            # explicit choice (e.g. a benchmark script) isn't silently
+            # downgraded to a single device.
+            enforce_min_slab = (self._TRY_POOLED_SMOOTH
+                                 and self._requested_mode != "MULTI_GPU")
             try:
                 self._pool = parallel_gpu_domain.DomainGPUMatVecPool(
                     edof0_host, self._KE_host, lv0['ndof'], plan.n_workers,
-                    dims=lv0['dims'], verbose=self.verbose)
+                    dims=lv0['dims'], verbose=self.verbose,
+                    enforce_min_slab=enforce_min_slab)
                 return
             except Exception as exc:
                 if self.verbose:
@@ -323,24 +285,30 @@ class MGSolver:
             d = xp.where(d == 0, 1.0, d)
             lv['Minv'] = 1.0 / d
             lv['_scaled'] = scaled
+            if li == 0 and self._pool is not None and hasattr(self._pool, 'set_bc'):
+                # Keep the pool's per-device Jacobi weight/free-mask in sync
+                # for smooth() (see parallel_gpu_domain.DomainGPUMatVecPool
+                # .set_bc/.smooth) -- same "cheap enough per SIMP iteration,
+                # not per CG/smoothing iteration" reasoning as set_density
+                # above. hasattr-guarded because the plain broadcast pool
+                # (parallel_gpu.GPUMatVecPool, the multi_gpu fallback one
+                # rung down) has no smoother of its own -- MGSolver just
+                # keeps using its existing single-device _smooth loop then.
+                self._pool.set_bc(backend.asnumpy(lv['Minv']),
+                                   backend.asnumpy(lv['free']))
 
     # -- operators ----------------------------------------------------------
     def _apply(self, li, u):
-        """Local (never pooled) matrix-free apply. Used by the V-cycle
-        smoother/residual (_smooth, _vcycle) -- called ~5x per outer CG
-        iteration just at level 0 alone (n_smooth pre- + post-smoothing
-        passes, plus the V-cycle's own residual). Splitting *this* across
-        devices/processes was the actual cause of a measured 1.5-3.5x
-        MULTI-GPU SLOWDOWN vs. single-GPU on real hardware (2x GTX 970,
-        see paper/experiments/benchmark_multigpu.py): each smoothing pass
-        paid a full host round-trip on every device, for work too small
-        and too frequent to amortize that cost. See _apply_pooled for the
-        one call site that's actually meant to be split.
+        """Local (never pooled) matrix-free apply. Used by _vcycle's residual
+        computation at every level, and by _smooth as a fallback when no
+        domain pool with a smooth() method is available. Splitting
+        individual _apply calls across devices (rather than batching a whole
+        sweep into one dispatch) measured as a 1.5-3.5x multi-GPU slowdown
+        vs. single-GPU -- each call pays a full per-device context-switch
+        cost too small to amortize. See _apply_pooled and
+        DomainGPUMatVecPool.smooth for the pooled alternatives.
 
-        Wall-clock time spent here (across the whole solve() call, all
-        levels combined) accumulates into self._t_local -- see "multi_gpu
-        xp history" in the module docstring for why this instrumentation
-        was added instead of another guess."""
+        Wall-clock time spent here accumulates into self._t_local."""
         t0 = time.perf_counter()
         xp = self.xp
         lv = self.levels[li]
@@ -378,11 +346,37 @@ class MGSolver:
         return out
 
     def _smooth(self, li, u, b, iters):
+        # Pooled multi-GPU smoothing uses DomainGPUMatVecPool's ghost-element
+        # ring (each device holds a read-only copy of its neighbour's
+        # adjacent element layer, frozen for the whole sweep sequence) so the
+        # local matvec is exact at every owned node -- correctness-neutral,
+        # only affects preconditioner quality. It's disabled by default
+        # (_TRY_POOLED_SMOOTH = False): real-hardware measurement showed it's
+        # a net performance loss (fixed per-dispatch overhead roughly
+        # triples going from 1 pooled call/iteration to 3), even though it's
+        # correct. Flip _TRY_POOLED_SMOOTH to re-measure on other hardware.
         xp = self.xp
         lv = self.levels[li]
         free = lv['free']
         Minv = lv['Minv']
         w = self.omega
+        # Two independent gates: _TRY_POOLED_SMOOTH (GPU, off by default per
+        # above) and _pool_smooth_enabled (CPU, set from
+        # compute_plan.POOLED_SMOOTH_CPU_DOF -- see MULTIPROCESSING_FINDINGS.md).
+        # Kept separate so one path's measured result never silently
+        # overrides the other's.
+        pooled_smooth_ok = (
+            (self._TRY_POOLED_SMOOTH and getattr(self.plan, "kind", None) == "multi_gpu")
+            or self._pool_smooth_enabled)
+        if (pooled_smooth_ok and li == 0 and self._pool is not None
+                and hasattr(self._pool, 'smooth')):
+            t0 = time.perf_counter()
+            u_host = self._pool.smooth(backend.asnumpy(u), backend.asnumpy(b),
+                                        iters, w)
+            u = xp.asarray(u_host)
+            self._t_pooled += time.perf_counter() - t0
+            self._n_pooled_calls += 1
+            return u
         for _ in range(iters):
             r = b - self._apply(li, u)
             u = u + w * xp.where(free, Minv * r, 0.0)
@@ -451,25 +445,58 @@ class MGSolver:
         rz = float(r @ z)
         max_cg = max_cg or 200
         self.last_iters = 0
+        self.last_converged = False
+        self.last_resid_ratio = float("nan")
         for it in range(max_cg):
             Ap = self._apply_pooled(p)
-            alpha = rz / float(p @ Ap)
+            pAp = float(p @ Ap)
+            if pAp == 0.0:
+                # p@Ap vanishing means the search direction has no more
+                # energy left w.r.t. the true operator -- treat as converged
+                # (for an SPD system) rather than raising ZeroDivisionError.
+                self.last_converged = (self.last_resid_ratio < tol)
+                break
+            alpha = rz / pAp
             u = u + alpha * p
             r = r - alpha * Ap
             self.last_iters = it + 1
-            if float(xp.linalg.norm(r)) / fnorm < tol:
+            self.last_resid_ratio = float(xp.linalg.norm(r)) / fnorm
+            if self.last_resid_ratio < tol:
+                self.last_converged = True
                 break
             z = self._vcycle(0, r)
             rz_new = float(r @ z)
-            p = z + (rz_new / rz) * p
+            if rz == 0.0:
+                # Same reasoning as the pAp guard above: restart the search
+                # direction from the raw preconditioned residual instead of
+                # dividing by zero (a valid PCG restart).
+                p = z.copy()
+            else:
+                p = z + (rz_new / rz) * p
             rz = rz_new
         u = xp.where(free, u, 0.0)
+        if not self.last_converged:
+            # One V-cycle should get CG to a near-constant iteration count
+            # (typically ~10-30) regardless of resolution, so hitting the cap
+            # is a correctness signal worth always printing: either the
+            # preconditioner isn't helping for this density state, or (on a
+            # pooled multi_gpu plan) the pooled matvec may be inconsistent
+            # with the local operator.
+            print(f"[Blendtopo] WARNING: MG-PCG did not converge in "
+                  f"{max_cg} iterations (tol={tol:g}, final residual ratio="
+                  f"{self.last_resid_ratio:.3e}, plan="
+                  f"{self.plan.label if self.plan is not None else 'pinned xp'}"
+                  f"). Returned displacement may be inaccurate; if reproducible "
+                  f"for a size/mode that used to converge, suspect the pooled "
+                  f"matvec (parallel_gpu_domain.py / parallel_gpu.py) rather "
+                  f"than the multigrid math itself.")
         if self.verbose:
             t_total = time.perf_counter() - t_solve0
             t_other = t_total - self._t_pooled - self._t_local
             pool_label = (self._pool.__class__.__name__
                           if self._pool is not None else "none (local only)")
-            print(f"[Blendtopo] MG solve: {self.last_iters} CG iters, "
+            print(f"[Blendtopo] MG solve: {self.last_iters} CG iters "
+                  f"(converged={self.last_converged}), "
                   f"total={t_total * 1e3:.1f}ms | "
                   f"pooled={self._t_pooled * 1e3:.1f}ms "
                   f"({self._n_pooled_calls} calls via {pool_label}) | "

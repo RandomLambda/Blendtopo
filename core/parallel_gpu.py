@@ -2,35 +2,26 @@
 """
 Multi-GPU matvec for the matrix-free FEA (GPU edition only).
 
-Mirrors ``parallel_cpu.CPUMatVecPool`` exactly: the element list is split
-into contiguous chunks, one per visible CUDA device, and each device
-computes a partial output vector (gather -> 24x24 matmul -> scale by density
--> scatter-add) which is then summed. Same non-approximation argument as the
-CPU version: because the scatter-add only writes by index, summing the
-per-device partials reproduces exactly what one full-precision bincount over
-all elements would give (up to floating-point summation-order round-off,
-identical in spirit to running the CPU pool with >1 worker).
+The element list is split into contiguous chunks, one per visible CUDA
+device; each device computes a partial output vector (gather -> 24x24 matmul
+-> scale by density -> scatter-add), then the partials are summed on the
+host. Because the scatter-add only writes by index, summing per-device
+partials reproduces exactly what one full-precision bincount over all
+elements would give (up to floating-point summation-order round-off).
 
-Unlike the CPU pool this does NOT use separate OS processes -- Cu-Py already
-lets one Python process drive multiple CUDA devices via ``cp.cuda.Device(i)``
-context managers, so each "worker" here is just a per-device array cache in
-this process. Per apply() call: broadcast p to every device (host-staged: one
-D2H copy off whichever device p currently lives on -- typically none-of-them,
-p lives on the host between CG steps already -- then one H2D copy to each of
-the N devices), compute the local partial on each device, copy each partial
-back to host and sum there. Peer-to-peer device-to-device transfers are
-deliberately NOT used: enabling P2P requires ``cudaDeviceEnablePeerAccess``,
-which can fail silently on some topologies (e.g. GPUs on different PCIe root
-complexes, or mixed GPU models) -- host-staging is slower but always works,
-and correctness beats speed for a first release of a feature that cannot be
-validated against real multi-GPU hardware in this development environment.
+One Python process drives multiple CUDA devices via ``cp.cuda.Device(i)``
+context managers; each "worker" is a per-device array cache. Per apply()
+call: broadcast p to every device (host-staged H2D), compute the local
+partial, copy back and sum on the host. Peer-to-peer transfers are
+deliberately not used -- ``cudaDeviceEnablePeerAccess`` can fail silently on
+some topologies (mixed GPU models, different PCIe roots), and host-staging
+always works.
 
-** This module has been written and reasoned through carefully but has not
-been exercised on real multi-GPU hardware (no such hardware was available
-while developing it). It only activates when compute_plan.choose() picks
-"multi_gpu" (default: ndof >= compute_plan.MULTI_GPU_DOF and >1 usable CUDA
-device). Run with the "Verbose solver log" option enabled and check the
-printed device count / timings the first time you use it on your machine. **
+Only activates when compute_plan.choose() picks "multi_gpu" (see that
+module for the threshold). Superseded for MGSolver's level-0 operator by
+the domain-decomposed pool in parallel_gpu_domain.py, which transfers only
+each device's own DOF slice; this module remains as fea.VoxelFEA's
+multi_gpu fallback for its arbitrary active-element subsets.
 """
 
 import numpy as np

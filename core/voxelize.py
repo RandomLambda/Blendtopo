@@ -195,9 +195,10 @@ def build_grid_steps(settings, depsgraph, resolution=None):
 
     # Pre-count total work so the caller can show a percentage.
     n_excl = sum(1 for it in settings.exclude if it.obj is not None)
+    n_incl = sum(1 for it in getattr(settings, "include", []) if it.obj is not None)
     n_bear = sum(1 for b in settings.bearings if b.obj is not None)
     n_load = sum(1 for ld in settings.loads if ld.obj is not None)
-    total = len(centers) * (1 + n_excl) + len(nodes) * (n_bear + n_load)
+    total = len(centers) * (1 + n_excl + n_incl) + len(nodes) * (n_bear + n_load)
     done = [0]
 
     def _run(inner):
@@ -222,7 +223,20 @@ def build_grid_steps(settings, depsgraph, resolution=None):
         t = _bvh_from_object(item.obj, depsgraph)
         excl = excl | (yield from _run(_inside_mask_steps(t, centers, reach)))
 
-    grid.active = (inside & ~excl)
+    # Inclusions force voxels part of the design domain (keep-out still wins
+    # where the two overlap). Note: unlike the preferred subprocess solver
+    # path, this in-process fallback does not force the *displayed* density
+    # to 1 inside keep-in volumes - it only guarantees they're part of the
+    # active/optimizable domain.
+    keepin = np.zeros(len(centers), dtype=bool)
+    for item in getattr(settings, "include", []):
+        if item.obj is None:
+            continue
+        t = _bvh_from_object(item.obj, depsgraph)
+        keepin = keepin | (yield from _run(_inside_mask_steps(t, centers, reach)))
+    keepin = keepin & ~excl
+
+    grid.active = (inside | keepin) & ~excl
 
     # Bearings -> fixed node DOFs.
     fixed = []
@@ -368,6 +382,13 @@ class AsyncVoxelizer:
             queries.append({'verts': v, 'faces': f, 'target': 'centers'})
             descr.append(('exclude', None))
 
+        for item in getattr(settings, "include", []):
+            if item.obj is None:
+                continue
+            v, f = _object_triangles(item.obj, depsgraph)
+            queries.append({'verts': v, 'faces': f, 'target': 'centers'})
+            descr.append(('include', None))
+
         for b in settings.bearings:
             if b.obj is None:
                 continue
@@ -447,6 +468,7 @@ class AsyncVoxelizer:
         grid = self._grid
         inside = None
         excl = np.zeros(grid.nx * grid.ny * grid.nz, dtype=bool)
+        keepin = np.zeros(grid.nx * grid.ny * grid.nz, dtype=bool)
         fixed = []
         force = np.zeros(grid.ndof)
 
@@ -456,6 +478,8 @@ class AsyncVoxelizer:
                 inside = mask
             elif role == 'exclude':
                 excl = excl | mask
+            elif role == 'include':
+                keepin = keepin | mask
             elif role == 'bearing':
                 fix_x, fix_y, fix_z = meta
                 for n in np.where(mask)[0]:
@@ -475,7 +499,8 @@ class AsyncVoxelizer:
 
         if inside is None:
             inside = np.zeros(grid.nx * grid.ny * grid.nz, dtype=bool)
-        grid.active = (inside & ~excl)
+        keepin = keepin & ~excl
+        grid.active = (inside | keepin) & ~excl
         grid.fixed_dofs = (np.unique(np.asarray(fixed, dtype=np.int64))
                            if fixed else np.zeros(0, dtype=np.int64))
         grid.force = force

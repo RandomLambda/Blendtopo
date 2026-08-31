@@ -37,6 +37,17 @@ import sys
 import tempfile
 import time
 
+# EMA smoothing factor for the von Mises heatmap's color-scale ceiling (see
+# _worker_main): weight on the *previous* smoothed value, so 0.7 means each
+# new iteration only nudges the scale 30% of the way toward its own reading.
+# Keeps the color scale from flickering step to step while still tracking
+# real trends (e.g. the true max stress climbing as the shape refines).
+_STRESS_EMA_ALPHA = 0.7
+# Percentile (of active-element stress) used as the scale ceiling instead of
+# the raw max, so the handful of singular elements that always sit at point
+# loads/supports on a voxel grid don't wash out the rest of the heatmap.
+_STRESS_PERCENTILE = 98.0
+
 
 # ===========================================================================
 # Parent side: launch + non-blocking poll (runs inside Blender, bpy-free)
@@ -48,7 +59,10 @@ class SolverClient:
     Events from :meth:`poll`:
       ('voxel', frac)            - still building the grid (0..1)
       ('step', dict)             - a new iteration is ready (it, compliance,
-                                   change, verts, faces); build a preview object
+                                   change, verts, faces, and - if the job asked
+                                   for a stress heatmap - stress3d/stress_vmax/
+                                   stress_origin/stress_vsize); build a preview
+                                   object
       ('done', dict)             - finished; dict has rho3d/u/dims/origin/vsize
                                    for the warm-start / Continue cache
       ('error', message)         - the worker failed
@@ -284,9 +298,32 @@ def _worker_main(job_path, work_dir):
         done_pts[0] += len(pts)
         set_status(phase="voxel", frac=done_pts[0] / total_pts, last_step=0)
 
+    # --- bearing fallback: snap to nearest node instead of erroring out ---
+    # At coarse (early-refinement) resolutions a small bearing mesh can miss
+    # every grid node in its inside-test. Rather than aborting the whole run,
+    # pin the single nearest node so the level still solves; once the grid
+    # is fine enough the normal inside-test takes over again and the bearing
+    # is represented properly.
+    for i, (q, (role, meta)) in enumerate(zip(queries, descr)):
+        if role != "bearing" or masks[i].any():
+            continue
+        pts = point_sets[q["target"]]
+        verts = np.asarray(q["verts"], dtype=float)
+        if len(verts) == 0 or len(pts) == 0:
+            continue
+        centroid = verts.mean(axis=0)
+        d2 = np.sum((pts - centroid) ** 2, axis=1)
+        idx = int(np.argmin(d2))
+        fallback_mask = np.zeros(len(pts), dtype=bool)
+        fallback_mask[idx] = True
+        masks[i] = fallback_mask
+        print(f"[Blendtopo] bearing '{q.get('name', '?')}' covered no grid "
+              f"nodes at this resolution - snapped to nearest node instead.")
+
     # --- assemble grid ----------------------------------------------------
     inside = None
     excl = np.zeros(nx * ny * nz, dtype=bool)
+    keepin = np.zeros(nx * ny * nz, dtype=bool)
     fixed = []
     ndof = 3 * (nx + 1) * (ny + 1) * (nz + 1)
     force = np.zeros(ndof)
@@ -295,6 +332,8 @@ def _worker_main(job_path, work_dir):
             inside = mask
         elif role == "exclude":
             excl = excl | mask
+        elif role == "include":
+            keepin = keepin | mask
         elif role == "bearing":
             fix_x, fix_y, fix_z = meta
             for n in np.where(mask)[0]:
@@ -312,7 +351,9 @@ def _worker_main(job_path, work_dir):
                     force[3 * n:3 * n + 3] += fv
     if inside is None:
         inside = np.zeros(nx * ny * nz, dtype=bool)
-    active = inside & ~excl
+    # Keep-out always wins over keep-in if the two overlap.
+    keepin = keepin & ~excl
+    active = (inside | keepin) & ~excl
     fixed_dofs = (np.unique(np.asarray(fixed, dtype=np.int64))
                   if fixed else np.zeros(0, dtype=np.int64))
 
@@ -342,6 +383,14 @@ def _worker_main(job_path, work_dir):
 
     # --- SIMP solve, streaming a mesh per iteration -----------------------
     active3d = active.reshape(nx, ny, nz)
+    # Keep-in voxels are forced to density=1 for meshing/display only - never
+    # fed back into the optimizer's own state (x_init / warm-start / FEA),
+    # so the solve itself is unaffected and always sees the real, optimized
+    # density. This is a display-time union: the visible shape always
+    # includes the keep-in volume and merges smoothly with it, while the
+    # optimization is free to make the rest of the design lighter to
+    # compensate.
+    keepin3d = keepin.reshape(nx, ny, nz) if keepin.any() else None
     prob = Problem(nx, ny, nz, active3d, fixed_dofs, force,
                    volfrac=sp["volfrac"], penalty=sp["penalty"],
                    rmin=sp["rmin"], nu=sp["nu"], e0=sp["e0"],
@@ -352,6 +401,8 @@ def _worker_main(job_path, work_dir):
 
     iso = float(job["iso"])
     style = job.get("style", "SMOOTH")
+    want_stress = bool(job.get("stress", False))
+    stress_vmax_smooth = [None]   # EMA state, carried across this level's iterations
 
     def mesh_of(rho3d):
         if style == "BLOCKY":
@@ -371,11 +422,43 @@ def _worker_main(job_path, work_dir):
                 u_init=u_init):
             rho3d = rho.reshape(nx, ny, nz)
             last_rho3d = rho3d
-            verts, faces = mesh_of(rho3d)
+            mesh_rho3d = np.where(keepin3d, 1.0, rho3d) if keepin3d is not None else rho3d
+            verts, faces = mesh_of(mesh_rho3d)
+            step_payload = {"it": int(it), "compliance": float(comp),
+                            "change": float(change), "verts": verts, "faces": faces}
+
+            if want_stress:
+                vm = prob.element_von_mises(rho)
+                active_vals = vm[active]
+                raw_vmax = (float(np.percentile(active_vals, _STRESS_PERCENTILE))
+                           if active_vals.size else 0.0)
+                raw_vmax = max(raw_vmax, 1e-12)
+                if stress_vmax_smooth[0] is None:
+                    stress_vmax_smooth[0] = raw_vmax
+                else:
+                    stress_vmax_smooth[0] = (
+                        _STRESS_EMA_ALPHA * stress_vmax_smooth[0]
+                        + (1.0 - _STRESS_EMA_ALPHA) * raw_vmax)
+                step_payload["stress3d"] = vm.reshape(nx, ny, nz).astype(np.float32)
+                step_payload["stress_vmax"] = float(stress_vmax_smooth[0])
+                step_payload["stress_origin"] = np.asarray(origin, dtype=float)
+                step_payload["stress_vsize"] = vsize
+                # Every active element, not a decimated sample - a
+                # cross-section should never be missing material that's
+                # actually there.
+                step_payload["stress_active3d"] = active.reshape(nx, ny, nz)
+                # Reliability weight for the *surface* heatmap's vertex
+                # sampling: SIMP density IS the element's fill fraction, so
+                # a mostly-void border element (cut obliquely by the iso-
+                # surface) is down-weighted instead of dragging the
+                # trilinear average toward its near-zero stress estimate -
+                # this is what removes the false "blue ring" banding along
+                # slanted faces (see extract._sample_field_trilinear_weighted).
+                step_payload["stress_weight3d"] = (
+                    rho3d * active3d).astype(np.float32)
+
             _atomic_write_pickle(
-                os.path.join(work_dir, f"step_{it}.pkl"),
-                {"it": int(it), "compliance": float(comp), "change": float(change),
-                 "verts": verts, "faces": faces})
+                os.path.join(work_dir, f"step_{it}.pkl"), step_payload)
             last_it = it
             set_status(phase="solve", frac=it / max(1, sp["max_iter"]),
                        last_step=int(it))
